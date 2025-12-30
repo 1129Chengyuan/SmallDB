@@ -15,8 +15,8 @@ void MemTable::set(const Slice& key, const Slice& value) {
 
 // O(log n) lookup due to underlying red-black tree
 std::string MemTable::get(const Slice& key) const {
-  std::string key = std::string(key.data(), key.size());
-  auto iterator = table.find(key);
+  std::string stringKey = std::string(key.data(), key.size());
+  auto iterator = table.find(stringKey);
   if (iterator != table.end()) {
     // in C++ this should be the value
     return iterator->second;
