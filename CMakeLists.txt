@@ -4,11 +4,11 @@ project(SmallDB)
 set(CMAKE_CXX_STANDARD 20)
 
 add_executable(SmallDB main.cpp
-        MemTable.cpp
-        MemTable.h
+        mem_table.cpp
+        mem_table.h
         WAL.cpp
         WAL.h
-        SSTable.cpp
-        SSTable.h
+        ss_table.cpp
+        ss_table.h
         Slice.h
 )

@@ -1,18 +1,18 @@
 #ifndef MEMTABLE_H
 #define MEMTABLE_H
 
-#include <string>
+#include "slice.h"
 #include <map>
-#include "Slice.h"
+#include <string>
 
-class MemTable {
+class mem_table {
 public:
   // Size threshold in bytes before flushing to SSTable
-  MemTable(size_t threshold);
+  mem_table(size_t threshold);
 
-  void set(const Slice& key, const Slice& value);;
+  void set(const slice& key, const slice& value);;
 
-  std::string get(const Slice& key) const;
+  std::string get(const slice& key) const;
 
   bool isFull() const;
 
