@@ -10,8 +10,8 @@ mem_table::mem_table(size_t threshold) {
 }
 
 void mem_table::set(const slice& key, const slice& value) {
-  std::string string_key = std::string(key.data(), key.size());
-  std::string string_value = std::string(value.data(), value.size());
+  std::string string_key = key.toString();
+  std::string string_value = value.toString();
   // O(logn) operation
   auto iterator = table.find(string_key);
 
@@ -27,7 +27,7 @@ void mem_table::set(const slice& key, const slice& value) {
 
 // O(log n) lookup due to underlying red-black tree
 std::string mem_table::get(const slice& key) const {
-  std::string stringKey = std::string(key.data(), key.size());
+  std::string stringKey = key.toString();
   auto iterator = table.find(stringKey);
   if (iterator != table.end()) {
     // in C++ this should be the value

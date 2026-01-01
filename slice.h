@@ -43,6 +43,11 @@ public:
     }
   }
 
+  // Like Java toString()
+  std::string toString() const {
+    return std::string(data_, size_);
+  }
+
 private:
   const char* data_;
   size_t size_;
