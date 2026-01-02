@@ -17,6 +17,7 @@ wal::~wal() {
   }
 }
 
+// Push in [key_size][value_size][key_data][value_data]
 void wal::append(const slice& key, const slice& value) {
   if (!wal_file.is_open()) {
     std::cout << wal_file_name << "failed to append" << std::endl;

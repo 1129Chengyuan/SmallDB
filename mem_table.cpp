@@ -30,10 +30,17 @@ std::string mem_table::get(const slice& key) const {
   std::string stringKey = key.toString();
   auto iterator = table.find(stringKey);
   if (iterator != table.end()) {
+    if (iterator->second == tombstone) {
+      return "";
+    }
     // in C++ this should be the value
     return iterator->second;
   }
   return "";
+}
+
+void mem_table::remove(const slice& key) {
+  this->set(key, slice(tombstone));
 }
 
 bool mem_table::isFull() const {

@@ -7,12 +7,17 @@
 
 class mem_table {
 public:
+  // USED TO MARK DELETED ENTRIES
+  static constexpr const char* tombstone = "<<TOMBSTONE>>";
+
   // Size threshold in bytes before flushing to SSTable
   mem_table(size_t threshold);
 
-  void set(const slice& key, const slice& value);;
+  void set(const slice& key, const slice& value);
 
   std::string get(const slice& key) const;
+
+  void remove(const slice& key);
 
   bool isFull() const;
 

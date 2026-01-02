@@ -11,4 +11,8 @@ add_executable(SmallDB main.cpp
         ss_table.cpp
         ss_table.h
         Slice.h
+        compaction.cpp
+        compaction.h
+        smalldb.cpp
+        smalldb.h
 )

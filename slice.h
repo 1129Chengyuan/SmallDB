@@ -41,6 +41,7 @@ public:
         return 1;
       return 0;
     }
+    return result < 0 ? -1 : 1;
   }
 
   // Like Java toString()
