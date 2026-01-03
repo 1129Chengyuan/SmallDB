@@ -1,9 +1,17 @@
-**Completed**
-MemTable
-Slice
+**Issues**  
+get() is O(m*n), which is super slow since worst case is multiple I/O reads  
+during compaction everything is fit into RAM, which is a gigantic memory pressure  
 
-**In Progress**
-WAL
+**Completed**  
+mem_table  
+slice  
+wal  
+ss_table  
+compaction  
+smalldb  
 
-**Not Started**
-SSTable
+**In Progress**  
+  
+**Not Started**  
+Bloom filters  
+Streaming merge  
