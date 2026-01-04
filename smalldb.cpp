@@ -14,22 +14,26 @@ smalldb::smalldb(const std::string& data_dir, size_t memtable_threshold)
     fs::create_directories(data_dir_);
   }
 
+  // Create the mem_table and WAL
   memtable_ = std::make_unique<mem_table>(memtable_threshold_);
 
   std::string wal_path = data_dir_ + "/wal.log";
   write_ahead_log_ = std::make_unique<wal>(wal_path);
 
+  // Starting up: load existing SSTables and recover from wal in case of crash
   load_sstables();
 
   recover_from_wal();
 }
 
+// Destructor: flush memtable if not empty
 smalldb::~smalldb() {
   if (memtable_ && !memtable_->getData().empty()) {
     flush_memtable();
   }
 }
 
+// put: inserting or updating data
 void smalldb::put(const slice& key, const slice& value) {
   write_ahead_log_->append(key, value);
 
@@ -40,12 +44,16 @@ void smalldb::put(const slice& key, const slice& value) {
   }
 }
 
+// get: retrieve data by key
 std::string smalldb::get(const slice& key) const {
   std::string result = memtable_->get(key);
+  // If we found something in memtable (including tombstone), return it
   if (!result.empty() || result == mem_table::tombstone) {
     return result == mem_table::tombstone ? "" : result;
   }
 
+  // Search SSTables in order from newest to oldest
+  // Complexity: O(m * n) where m is number of SSTables, n is entries per SSTable
   for (const auto& sstable_file : sstable_files_) {
     ss_table sstable(sstable_file);
     result = sstable.get(key);
@@ -57,10 +65,13 @@ std::string smalldb::get(const slice& key) const {
   return "";
 }
 
+// remove: mark key as deleted using tombstone
 void smalldb::remove(const slice& key) {
   put(key, slice(mem_table::tombstone));
 }
 
+// compact: merge all existing SSTables into one
+// Complexity: O(total entries log k) where k is number of SSTables
 void smalldb::compact() {
   if (sstable_files_.size() < 2) {
     std::cout << "Not enough SSTables to compact" << std::endl;
@@ -70,6 +81,7 @@ void smalldb::compact() {
   std::cout << "Starting compaction of " << sstable_files_.size()
             << " SSTables..." << std::endl;
 
+  // Read all SSTables into memory
   std::vector<std::map<std::string, std::string>> tables;
   for (const auto& file : sstable_files_) {
     tables.push_back(ss_table::read_all(file));
@@ -93,6 +105,7 @@ size_t smalldb::get_memtable_size() const {
   return memtable_->getData().size();
 }
 
+// Flush memtable to disk as a new SSTable
 void smalldb::flush_memtable() {
   if (memtable_->getData().empty()) {
     return;
@@ -120,6 +133,7 @@ void smalldb::load_sstables() {
 
   std::vector<std::pair<int, std::string>> files;
 
+  // Find data_directory for any .sst files
   for (const auto& entry : fs::directory_iterator(data_dir_)) {
     if (entry.path().extension() == ".sst") {
       std::string filename = entry.path().filename().string();

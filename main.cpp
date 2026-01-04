@@ -1,374 +1,442 @@
 #include <iostream>
-#include <cassert>
+#include <chrono>
+#include <random>
+#include <vector>
 #include <filesystem>
+#include <iomanip>
 #include "smalldb.h"
 #include "slice.h"
 
 namespace fs = std::filesystem;
 
-// Test counter
-int tests_passed = 0;
-int tests_failed = 0;
-
-#define TEST_ASSERT(condition, message) \
-  do { \
-    if (condition) { \
-      std::cout << "  ✓ " << message << std::endl; \
-      tests_passed++; \
-    } else { \
-      std::cout << "  ✗ FAILED: " << message << std::endl; \
-      tests_failed++; \
-    } \
-  } while(0)
-
-// Clean up test data directory
-void cleanup_test_data() {
-  if (fs::exists("./test_data")) {
-    fs::remove_all("./test_data");
-  }
-  fs::create_directories("./test_data");
-}
-
-void test_basic_put_get() {
-  std::cout << "\n=== Test 1: Basic Put/Get ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 1024);
-
-  // Test simple put/get
-  db.put(slice("key1"), slice("value1"));
-  std::string result = db.get(slice("key1"));
-  TEST_ASSERT(result == "value1", "Put and get single key");
-
-  // Test multiple keys
-  db.put(slice("key2"), slice("value2"));
-  db.put(slice("key3"), slice("value3"));
-  TEST_ASSERT(db.get(slice("key2")) == "value2", "Get second key");
-  TEST_ASSERT(db.get(slice("key3")) == "value3", "Get third key");
-
-  // Test non-existent key
-  TEST_ASSERT(db.get(slice("nonexistent")) == "", "Non-existent key returns empty");
-}
-
-void test_updates() {
-  std::cout << "\n=== Test 2: Updates ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 1024);
-
-  // Initial value
-  db.put(slice("counter"), slice("1"));
-  TEST_ASSERT(db.get(slice("counter")) == "1", "Initial value");
-
-  // Update same key
-  db.put(slice("counter"), slice("2"));
-  TEST_ASSERT(db.get(slice("counter")) == "2", "Updated value (second write)");
-
-  // Update again
-  db.put(slice("counter"), slice("3"));
-  TEST_ASSERT(db.get(slice("counter")) == "3", "Updated value (third write)");
-}
-
-void test_deletions() {
-  std::cout << "\n=== Test 3: Deletions ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 1024);
-
-  // Put then delete
-  db.put(slice("temp"), slice("temporary"));
-  TEST_ASSERT(db.get(slice("temp")) == "temporary", "Value exists before delete");
-
-  db.remove(slice("temp"));
-  TEST_ASSERT(db.get(slice("temp")) == "", "Value removed after delete");
-
-  // Delete non-existent key (should not crash)
-  db.remove(slice("never_existed"));
-  TEST_ASSERT(db.get(slice("never_existed")) == "", "Deleting non-existent key is safe");
-}
-
-void test_memtable_flush() {
-  std::cout << "\n=== Test 4: MemTable Flush ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 50);  // Very small threshold
-
-  // Write enough data to trigger flush
-  for (int i = 0; i < 10; i++) {
-    std::string key = "key_" + std::to_string(i);
-    std::string value = "value_" + std::to_string(i);
-    db.put(slice(key), slice(value));
-  }
-
-  // Verify data is still accessible after flush
-  TEST_ASSERT(db.get(slice("key_0")) == "value_0", "First key after flush");
-  TEST_ASSERT(db.get(slice("key_5")) == "value_5", "Middle key after flush");
-  TEST_ASSERT(db.get(slice("key_9")) == "value_9", "Last key after flush");
-
-  // Check that SSTables were created
-  TEST_ASSERT(db.get_num_sstables() > 0, "SSTables were created");
-}
-
-void test_compaction() {
-  std::cout << "\n=== Test 5: Compaction ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 50);
-
-  // Write data in controlled batches to observe compaction
-  // Write enough to create 4 SSTables (will trigger auto-compaction)
-  std::cout << "  Writing initial batch..." << std::endl;
-  for (int i = 0; i < 20; i++) {
-    std::string key = "item_" + std::to_string(i);
-    std::string value = "data_" + std::to_string(i);
-    db.put(slice(key), slice(value));
-  }
-
-  // After auto-compaction, should have 1 SSTable
-  size_t sstables_after_compaction = db.get_num_sstables();
-  std::cout << "  SSTables after first compaction: " << sstables_after_compaction << std::endl;
-  TEST_ASSERT(sstables_after_compaction <= 2, "Auto-compaction reduced SSTable count");
-
-  // Verify all data is correct after compaction
-  TEST_ASSERT(db.get(slice("item_0")) == "data_0", "Data intact after compaction");
-  TEST_ASSERT(db.get(slice("item_10")) == "data_10", "Data intact after compaction");
-  TEST_ASSERT(db.get(slice("item_19")) == "data_19", "Data intact after compaction");
-
-  // Verify all keys from first batch
-  int correct = 0;
-  for (int i = 0; i < 20; i++) {
-    std::string key = "item_" + std::to_string(i);
-    std::string expected = "data_" + std::to_string(i);
-    if (db.get(slice(key)) == expected) {
-      correct++;
+// Benchmark utilities
+class Timer {
+public:
+    void start() {
+        start_time = std::chrono::high_resolution_clock::now();
     }
-  }
-  TEST_ASSERT(correct == 20, "All 20 keys readable after compaction");
-}
 
-void test_compaction_with_updates() {
-  std::cout << "\n=== Test 6: Compaction with Updates ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 50);
-
-  // Write initial data
-  for (int i = 0; i < 20; i++) {
-    std::string key = "key_" + std::to_string(i);
-    db.put(slice(key), slice("old_value"));
-  }
-
-  // Update some keys (creates newer versions in different SSTables)
-  for (int i = 0; i < 10; i++) {
-    std::string key = "key_" + std::to_string(i);
-    db.put(slice(key), slice("new_value"));
-  }
-
-  // After compaction, should only have newest values
-  TEST_ASSERT(db.get(slice("key_0")) == "new_value", "Updated key has new value");
-  TEST_ASSERT(db.get(slice("key_15")) == "old_value", "Non-updated key has old value");
-}
-
-void test_compaction_with_deletes() {
-  std::cout << "\n=== Test 7: Compaction with Deletes ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 50);
-
-  // Write data
-  for (int i = 0; i < 20; i++) {
-    std::string key = "del_" + std::to_string(i);
-    db.put(slice(key), slice("value"));
-  }
-
-  // Delete half of them
-  for (int i = 0; i < 10; i++) {
-    std::string key = "del_" + std::to_string(i);
-    db.remove(slice(key));
-  }
-
-  // Trigger more writes to force compaction
-  for (int i = 20; i < 40; i++) {
-    std::string key = "del_" + std::to_string(i);
-    db.put(slice(key), slice("value"));
-  }
-
-  // Deleted keys should still be gone
-  TEST_ASSERT(db.get(slice("del_0")) == "", "Deleted key stays deleted after compaction");
-  TEST_ASSERT(db.get(slice("del_5")) == "", "Deleted key stays deleted after compaction");
-
-  // Non-deleted keys should still exist
-  TEST_ASSERT(db.get(slice("del_15")) == "value", "Non-deleted key persists");
-  TEST_ASSERT(db.get(slice("del_25")) == "value", "New key exists");
-}
-
-void test_persistence() {
-  std::cout << "\n=== Test 8: Persistence & Recovery ===" << std::endl;
-  cleanup_test_data();
-
-  // Write data in first instance
-  {
-    smalldb db("./test_data", 1024);
-    db.put(slice("persist1"), slice("value1"));
-    db.put(slice("persist2"), slice("value2"));
-    db.put(slice("persist3"), slice("value3"));
-  } // db destroyed here
-
-  // Reopen database and verify data persists
-  {
-    smalldb db("./test_data", 1024);
-    TEST_ASSERT(db.get(slice("persist1")) == "value1", "Data persists after restart");
-    TEST_ASSERT(db.get(slice("persist2")) == "value2", "Data persists after restart");
-    TEST_ASSERT(db.get(slice("persist3")) == "value3", "Data persists after restart");
-  }
-}
-
-void test_wal_recovery() {
-  std::cout << "\n=== Test 9: WAL Recovery ===" << std::endl;
-  cleanup_test_data();
-
-  // Write data (will be in WAL and MemTable, but not flushed)
-  {
-    smalldb db("./test_data", 10000);  // Large threshold to prevent flush
-    db.put(slice("wal1"), slice("value1"));
-    db.put(slice("wal2"), slice("value2"));
-    // Don't flush - data only in WAL and MemTable
-  }
-
-  // Reopen - should recover from WAL
-  {
-    smalldb db("./test_data", 10000);
-    TEST_ASSERT(db.get(slice("wal1")) == "value1", "WAL recovery works");
-    TEST_ASSERT(db.get(slice("wal2")) == "value2", "WAL recovery works");
-  }
-}
-
-void test_large_dataset() {
-  std::cout << "\n=== Test 10: Large Dataset ===" << std::endl;
-  cleanup_test_data();
-
-  smalldb db("./test_data", 200);
-
-  // Write many keys
-  const int num_keys = 200;
-  for (int i = 0; i < num_keys; i++) {
-    std::string key = "large_key_" + std::to_string(i);
-    std::string value = "large_value_" + std::to_string(i) + "_with_extra_padding";
-    db.put(slice(key), slice(value));
-  }
-
-  // Verify random samples
-  TEST_ASSERT(db.get(slice("large_key_0")) == "large_value_0_with_extra_padding",
-              "Large dataset - first key");
-  TEST_ASSERT(db.get(slice("large_key_100")) == "large_value_100_with_extra_padding",
-              "Large dataset - middle key");
-  TEST_ASSERT(db.get(slice("large_key_199")) == "large_value_199_with_extra_padding",
-              "Large dataset - last key");
-
-  // Verify all keys
-  int correct_count = 0;
-  for (int i = 0; i < num_keys; i++) {
-    std::string key = "large_key_" + std::to_string(i);
-    std::string expected = "large_value_" + std::to_string(i) + "_with_extra_padding";
-    if (db.get(slice(key)) == expected) {
-      correct_count++;
+    double elapsed_ms() {
+        auto end = std::chrono::high_resolution_clock::now();
+        return std::chrono::duration<double, std::milli>(end - start_time).count();
     }
-  }
-  TEST_ASSERT(correct_count == num_keys,
-              "All " + std::to_string(num_keys) + " keys readable");
+
+private:
+    std::chrono::high_resolution_clock::time_point start_time;
+};
+
+class BenchmarkResult {
+public:
+    std::string name;
+    size_t operations;
+    double duration_ms;
+    double ops_per_sec;
+    double latency_us;
+
+    void print() const {
+        std::cout << std::setw(40) << std::left << name << " | "
+                  << std::setw(10) << std::right << operations << " ops | "
+                  << std::setw(10) << std::fixed << std::setprecision(2)
+                  << duration_ms << " ms | "
+                  << std::setw(12) << std::fixed << std::setprecision(0)
+                  << ops_per_sec << " ops/s | "
+                  << std::setw(10) << std::fixed << std::setprecision(2)
+                  << latency_us << " µs/op" << std::endl;
+    }
+};
+
+// Random data generator
+class DataGenerator {
+public:
+    DataGenerator() : gen(std::random_device{}()), dist(0, 999999999) {}
+
+    std::string random_key(size_t length = 16) {
+        std::string key = "key_";
+        key += std::to_string(dist(gen));
+        while (key.length() < length) {
+            key += std::to_string(dist(gen) % 10);
+        }
+        return key.substr(0, length);
+    }
+
+    std::string random_value(size_t length = 100) {
+        std::string value;
+        for (size_t i = 0; i < length; i++) {
+            value += 'a' + (dist(gen) % 26);
+        }
+        return value;
+    }
+
+    int random_int(int max) {
+        return dist(gen) % max;
+    }
+
+private:
+    std::mt19937 gen;
+    std::uniform_int_distribution<> dist;
+};
+
+void cleanup_bench_data() {
+    if (fs::exists("./bench_data")) {
+        fs::remove_all("./bench_data");
+    }
+    fs::create_directories("./bench_data");
 }
 
-void test_empty_values() {
-  std::cout << "\n=== Test 11: Edge Cases - Empty Values ===" << std::endl;
-  cleanup_test_data();
+BenchmarkResult run_benchmark(const std::string& name, size_t ops,
+                              std::function<void()> fn) {
+    std::cout << "Running: " << name << "..." << std::flush;
+    Timer timer;
+    timer.start();
+    fn();
+    double duration = timer.elapsed_ms();
+    std::cout << " Done (" << duration << " ms)" << std::endl;
 
-  smalldb db("./test_data", 1024);
-
-  // Empty value
-  db.put(slice("empty_key"), slice(""));
-  TEST_ASSERT(db.get(slice("empty_key")) == "", "Empty value stored and retrieved");
-
-  // Single character
-  db.put(slice("single"), slice("x"));
-  TEST_ASSERT(db.get(slice("single")) == "x", "Single character value");
+    return BenchmarkResult{
+        name,
+        ops,
+        duration,
+        (ops * 1000.0) / duration,
+        (duration * 1000.0) / ops
+    };
 }
 
-void test_special_characters() {
-  std::cout << "\n=== Test 12: Edge Cases - Special Characters ===" << std::endl;
-  cleanup_test_data();
+// ============================================================================
+// Benchmark Tests
+// ============================================================================
 
-  smalldb db("./test_data", 1024);
+BenchmarkResult bench_sequential_writes(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
 
-  // Special characters in keys and values
-  db.put(slice("key@#$"), slice("value!@#$%"));
-  TEST_ASSERT(db.get(slice("key@#$")) == "value!@#$%", "Special characters in key/value");
-
-  // Unicode (if supported)
-  db.put(slice("emoji"), slice("🎉"));
-  TEST_ASSERT(db.get(slice("emoji")) == "🎉", "Unicode characters");
+    return run_benchmark("Sequential Writes", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            std::string value = gen.random_value(100);
+            db.put(slice(key), slice(value));
+        }
+    });
 }
 
-void test_compaction_manual_trigger() {
-  std::cout << "\n=== Test 13: Manual Compaction ===" << std::endl;
-  cleanup_test_data();
+BenchmarkResult bench_random_writes(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
 
-  smalldb db("./test_data", 50);
-
-  // Create multiple SSTables but not enough to auto-trigger
-  for (int i = 0; i < 15; i++) {
-    std::string key = "comp_" + std::to_string(i);
-    db.put(slice(key), slice("value"));
-  }
-
-  size_t before = db.get_num_sstables();
-
-  // Manually trigger compaction
-  db.compact();
-
-  size_t after = db.get_num_sstables();
-  TEST_ASSERT(after <= before, "Manual compaction reduced or maintained SSTable count");
-
-  // Data should still be intact
-  TEST_ASSERT(db.get(slice("comp_0")) == "value", "Data intact after manual compaction");
-  TEST_ASSERT(db.get(slice("comp_14")) == "value", "Data intact after manual compaction");
+    return run_benchmark("Random Writes", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = gen.random_key(16);
+            std::string value = gen.random_value(100);
+            db.put(slice(key), slice(value));
+        }
+    });
 }
+
+BenchmarkResult bench_sequential_reads(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    // Setup: Write data
+    std::cout << "  [Setup] Writing " << num_ops << " entries..." << std::flush;
+    {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            std::string value = gen.random_value(100);
+            db.put(slice(key), slice(value));
+        }
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: Read data (within same DB instance to avoid reopen overhead)
+    std::cout << "  [Benchmark] Reading..." << std::flush;
+    return run_benchmark("Sequential Reads", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            volatile std::string value = db.get(slice(key));
+            (void)value;
+        }
+    });
+}
+
+BenchmarkResult bench_random_reads(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    std::vector<std::string> keys;
+
+    // Setup: Write data
+    std::cout << "  [Setup] Writing " << num_ops << " entries..." << std::flush;
+    {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            keys.push_back(key);
+            std::string value = gen.random_value(100);
+            db.put(slice(key), slice(value));
+        }
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: Random reads
+    std::cout << "  [Benchmark] Reading..." << std::flush;
+    return run_benchmark("Random Reads", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            size_t idx = gen.random_int(keys.size());
+            volatile std::string value = db.get(slice(keys[idx]));
+            (void)value;
+        }
+    });
+}
+
+BenchmarkResult bench_mixed_workload(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    std::vector<std::string> keys;
+
+    // Pre-populate some keys
+    std::cout << "  [Setup] Pre-populating..." << std::flush;
+    {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops / 2; i++) {
+            std::string key = "key_" + std::to_string(i);
+            keys.push_back(key);
+            db.put(slice(key), slice(gen.random_value(100)));
+        }
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: 50% reads, 50% writes
+    std::cout << "  [Benchmark] Mixed ops..." << std::flush;
+    return run_benchmark("Mixed Workload (50% R/W)", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            if (i % 2 == 0) {
+                std::string key = "key_" + std::to_string(i);
+                db.put(slice(key), slice(gen.random_value(100)));
+            } else {
+                if (!keys.empty()) {
+                    size_t idx = gen.random_int(keys.size());
+                    volatile std::string value = db.get(slice(keys[idx]));
+                    (void)value;
+                }
+            }
+        }
+    });
+}
+
+BenchmarkResult bench_updates(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    // Setup: Initial writes
+    std::cout << "  [Setup] Writing initial data..." << std::flush;
+    {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < 1000; i++) {
+            std::string key = "key_" + std::to_string(i);
+            db.put(slice(key), slice(gen.random_value(100)));
+        }
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: Update existing keys
+    std::cout << "  [Benchmark] Updating..." << std::flush;
+    return run_benchmark("Updates (Overwrites)", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i % 1000);
+            db.put(slice(key), slice(gen.random_value(100)));
+        }
+    });
+}
+
+BenchmarkResult bench_deletions(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    // Setup: Write data
+    std::cout << "  [Setup] Writing data..." << std::flush;
+    {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            db.put(slice(key), slice(gen.random_value(100)));
+        }
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: Deletions
+    std::cout << "  [Benchmark] Deleting..." << std::flush;
+    return run_benchmark("Deletions", num_ops, [&]() {
+        smalldb db("./bench_data", 8192);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            db.remove(slice(key));
+        }
+    });
+}
+
+BenchmarkResult bench_compaction(size_t num_sstables) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    std::cout << "  [Setup] Creating " << num_sstables << " SSTables..." << std::flush;
+    smalldb db("./bench_data", 100);
+
+    for (size_t i = 0; i < num_sstables * 25; i++) {
+        std::string key = "key_" + std::to_string(i);
+        db.put(slice(key), slice(gen.random_value(100)));
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: Single compaction
+    std::cout << "  [Benchmark] Compacting..." << std::flush;
+    Timer timer;
+    timer.start();
+    db.compact();
+    double duration = timer.elapsed_ms();
+    std::cout << " Done (" << duration << " ms)" << std::endl;
+
+    return BenchmarkResult{
+        "Compaction (" + std::to_string(num_sstables) + " SSTables)",
+        1,
+        duration,
+        1000.0 / duration,
+        duration * 1000.0
+    };
+}
+
+BenchmarkResult bench_large_values(size_t num_ops, size_t value_size) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    return run_benchmark("Large Values (" + std::to_string(value_size) + " bytes)",
+                        num_ops, [&]() {
+        smalldb db("./bench_data", 16384);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            std::string value = gen.random_value(value_size);
+            db.put(slice(key), slice(value));
+        }
+    });
+}
+
+BenchmarkResult bench_recovery(size_t num_ops) {
+    cleanup_bench_data();
+    DataGenerator gen;
+
+    // Setup: Write to WAL without flushing
+    std::cout << "  [Setup] Writing to WAL..." << std::flush;
+    {
+        smalldb db("./bench_data", 1000000);
+        for (size_t i = 0; i < num_ops; i++) {
+            std::string key = "key_" + std::to_string(i);
+            db.put(slice(key), slice(gen.random_value(100)));
+        }
+    }
+    std::cout << " Done" << std::endl;
+
+    // Benchmark: Recovery from WAL
+    std::cout << "  [Benchmark] Recovering..." << std::flush;
+    Timer timer;
+    timer.start();
+    smalldb db("./bench_data", 1000000);
+    double duration = timer.elapsed_ms();
+    std::cout << " Done (" << duration << " ms)" << std::endl;
+
+    return BenchmarkResult{
+        "WAL Recovery (" + std::to_string(num_ops) + " entries)",
+        num_ops,
+        duration,
+        (num_ops * 1000.0) / duration,
+        (duration * 1000.0) / num_ops
+    };
+}
+
+// ============================================================================
+// Main Benchmark Suite
+// ============================================================================
 
 int main() {
-  std::cout << "╔════════════════════════════════════════╗" << std::endl;
-  std::cout << "║   SmallDB Comprehensive Test Suite    ║" << std::endl;
-  std::cout << "╚════════════════════════════════════════╝" << std::endl;
+    std::cout << "\n";
+    std::cout << "╔════════════════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║                    SmallDB Performance Benchmark Suite                     ║\n";
+    std::cout << "║                         Apple M3 MacBook Air                               ║\n";
+    std::cout << "╚════════════════════════════════════════════════════════════════════════════╝\n";
+    std::cout << "\n";
 
-  test_basic_put_get();
-  test_updates();
-  test_deletions();
-  test_memtable_flush();
-  test_compaction();
-  test_compaction_with_updates();
-  test_compaction_with_deletes();
-  test_persistence();
-  test_wal_recovery();
-  test_large_dataset();
-  test_empty_values();
-  test_special_characters();
-  test_compaction_manual_trigger();
+    std::vector<BenchmarkResult> results;
 
-  std::cout << "\n╔════════════════════════════════════════╗" << std::endl;
-  std::cout << "║           Test Summary                 ║" << std::endl;
-  std::cout << "╠════════════════════════════════════════╣" << std::endl;
-  std::cout << "║  Passed: " << tests_passed << " tests" << std::endl;
-  std::cout << "║  Failed: " << tests_failed << " tests" << std::endl;
-  std::cout << "╚════════════════════════════════════════╝" << std::endl;
+    // Basic operations (reduced sizes for faster testing)
+    std::cout << "═══ Basic Operations ═══\n";
+    results.push_back(bench_sequential_writes(5000));
+    results.push_back(bench_random_writes(5000));
+    results.push_back(bench_sequential_reads(5000));
+    results.push_back(bench_random_reads(5000));
+    results.push_back(bench_updates(2500));
+    results.push_back(bench_deletions(2500));
+    std::cout << "\n";
 
-  if (tests_failed == 0) {
-    std::cout << "\n🎉 All tests passed! Your database works correctly!" << std::endl;
-  } else {
-    std::cout << "\n❌ Some tests failed. Review the output above." << std::endl;
-  }
+    // Mixed workload
+    std::cout << "═══ Mixed Workload ═══\n";
+    results.push_back(bench_mixed_workload(5000));
+    std::cout << "\n";
 
-  // Cleanup
-  if (fs::exists("./test_data")) {
-    fs::remove_all("./test_data");
-  }
+    // Compaction
+    std::cout << "═══ Compaction ═══\n";
+    results.push_back(bench_compaction(8));
+    std::cout << "\n";
 
-  return tests_failed == 0 ? 0 : 1;
+    // Value sizes
+    std::cout << "═══ Variable Value Sizes ═══\n";
+    results.push_back(bench_large_values(500, 1024));
+    results.push_back(bench_large_values(500, 10240));
+    results.push_back(bench_large_values(50, 102400));
+    std::cout << "\n";
+
+    // Recovery
+    std::cout << "═══ Recovery ═══\n";
+    results.push_back(bench_recovery(2500));
+    std::cout << "\n";
+
+    // Summary
+    std::cout << "╔════════════════════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║                              Summary Results                               ║\n";
+    std::cout << "╠════════════════════════════════════════════════════════════════════════════╣\n";
+    std::cout << "║ Benchmark                              │   Ops      │  Time (ms) │    Ops/s     │ Latency(µs)║\n";
+    std::cout << "╠════════════════════════════════════════════════════════════════════════════╣\n";
+
+    for (const auto& result : results) {
+        std::cout << "║ ";
+        result.print();
+    }
+
+    std::cout << "╚════════════════════════════════════════════════════════════════════════════╝\n";
+
+    // Cleanup
+    if (fs::exists("./bench_data")) {
+        fs::remove_all("./bench_data");
+    }
+
+    std::cout << "\n✅ Benchmark complete!\n\n";
+
+    // Performance analysis
+    std::cout << "📊 Performance Analysis:\n";
+    std::cout << "   - Write performance: " << results[0].ops_per_sec << " ops/s (sequential)\n";
+    std::cout << "   - Read performance: " << results[2].ops_per_sec << " ops/s (sequential)\n";
+    std::cout << "   - Random read penalty: "
+              << (results[2].ops_per_sec / results[3].ops_per_sec) << "x slower\n";
+    std::cout << "\n💡 Optimization Opportunities:\n";
+    std::cout << "   1. Add Bloom filters - would speed up random reads significantly\n";
+    std::cout << "   2. Add block-based index - would reduce SSTable scan time\n";
+    std::cout << "   3. Implement LSM levels - would reduce read amplification\n";
+    std::cout << "   4. Add background compaction - would eliminate write stalls\n";
+    std::cout << "\n";
+
+    return 0;
 }

@@ -40,6 +40,7 @@ private:
   // Delete old SSTable files after compaction
   void delete_old_sstables(const std::vector<std::string>& files);
 
+  // Directory to store data files
   std::string data_dir_;
   size_t memtable_threshold_;
 
