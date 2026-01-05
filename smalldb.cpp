@@ -14,29 +14,23 @@ smalldb::smalldb(const std::string& data_dir, size_t memtable_threshold)
     fs::create_directories(data_dir_);
   }
 
-  // Create the mem_table and WAL
   memtable_ = std::make_unique<mem_table>(memtable_threshold_);
 
   std::string wal_path = data_dir_ + "/wal.log";
   write_ahead_log_ = std::make_unique<wal>(wal_path);
 
-  // Starting up: load existing SSTables and recover from wal in case of crash
   load_sstables();
-
   recover_from_wal();
 }
 
-// Destructor: flush memtable if not empty
 smalldb::~smalldb() {
   if (memtable_ && !memtable_->getData().empty()) {
     flush_memtable();
   }
 }
 
-// put: inserting or updating data
 void smalldb::put(const slice& key, const slice& value) {
   write_ahead_log_->append(key, value);
-
   memtable_->set(key, value);
 
   if (memtable_->isFull()) {
@@ -44,18 +38,24 @@ void smalldb::put(const slice& key, const slice& value) {
   }
 }
 
-// get: retrieve data by key
 std::string smalldb::get(const slice& key) const {
   std::string result = memtable_->get(key);
-  // If we found something in memtable (including tombstone), return it
   if (!result.empty() || result == mem_table::tombstone) {
     return result == mem_table::tombstone ? "" : result;
   }
 
-  // Search SSTables in order from newest to oldest
-  // Complexity: O(m * n) where m is number of SSTables, n is entries per SSTable
-  for (const auto& sstable_file : sstable_files_) {
-    ss_table sstable(sstable_file);
+  // Check Bloom filters before reading SSTables
+  for (size_t i = 0; i < sstable_files_.size(); ++i) {
+    // Check if bloom filter exists for this SSTable
+    if (i < sstable_bloom_filters_.size() &&
+        sstable_bloom_filters_[i].second != nullptr) {
+      if (!sstable_bloom_filters_[i].second->contains(key)) {
+        continue; // Definitely not in this SSTable
+      }
+    }
+
+    // Either no bloom filter or bloom says "maybe present"
+    ss_table sstable(sstable_files_[i]);
     result = sstable.get(key);
     if (!result.empty()) {
       return result == mem_table::tombstone ? "" : result;
@@ -65,13 +65,10 @@ std::string smalldb::get(const slice& key) const {
   return "";
 }
 
-// remove: mark key as deleted using tombstone
 void smalldb::remove(const slice& key) {
   put(key, slice(mem_table::tombstone));
 }
 
-// compact: merge all existing SSTables into one
-// Complexity: O(total entries log k) where k is number of SSTables
 void smalldb::compact() {
   if (sstable_files_.size() < 2) {
     std::cout << "Not enough SSTables to compact" << std::endl;
@@ -81,7 +78,6 @@ void smalldb::compact() {
   std::cout << "Starting compaction of " << sstable_files_.size()
             << " SSTables..." << std::endl;
 
-  // Read all SSTables into memory
   std::vector<std::map<std::string, std::string>> tables;
   for (const auto& file : sstable_files_) {
     tables.push_back(ss_table::read_all(file));
@@ -97,6 +93,14 @@ void smalldb::compact() {
   sstable_files_.clear();
   sstable_files_.push_back(compacted_file);
 
+  // Rebuild bloom filter for compacted SSTable
+  sstable_bloom_filters_.clear();
+  auto filter = std::make_unique<bloom_filter>(merged.size(), 0.01);
+  for (const auto& [key, value] : merged) {
+    filter->add(slice(key));
+  }
+  sstable_bloom_filters_.push_back({compacted_file, std::move(filter)});
+
   std::cout << "Compaction complete. Created " << compacted_file << std::endl;
   std::cout << "Compacted data contains " << merged.size() << " entries" << std::endl;
 }
@@ -105,7 +109,6 @@ size_t smalldb::get_memtable_size() const {
   return memtable_->getData().size();
 }
 
-// Flush memtable to disk as a new SSTable
 void smalldb::flush_memtable() {
   if (memtable_->getData().empty()) {
     return;
@@ -114,9 +117,19 @@ void smalldb::flush_memtable() {
   std::string sstable_name = get_next_sstable_name();
   std::cout << "Flushing memtable to " << sstable_name << std::endl;
 
+  // Create bloom filter BEFORE flushing
+  auto filter = std::make_unique<bloom_filter>(memtable_->getData().size(), 0.01);
+  for (const auto& [key, value] : memtable_->getData()) {
+    filter->add(slice(key));
+  }
+
   ss_table::flush_memtable(*memtable_, sstable_name);
 
   sstable_files_.insert(sstable_files_.begin(), sstable_name);
+  sstable_bloom_filters_.insert(
+      sstable_bloom_filters_.begin(),
+      {sstable_name, std::move(filter)}
+  );
 
   memtable_->clear();
   write_ahead_log_->clear();
@@ -126,6 +139,7 @@ void smalldb::flush_memtable() {
 
 void smalldb::load_sstables() {
   sstable_files_.clear();
+  sstable_bloom_filters_.clear();
 
   if (!fs::exists(data_dir_)) {
     return;
@@ -133,7 +147,6 @@ void smalldb::load_sstables() {
 
   std::vector<std::pair<int, std::string>> files;
 
-  // Find data_directory for any .sst files
   for (const auto& entry : fs::directory_iterator(data_dir_)) {
     if (entry.path().extension() == ".sst") {
       std::string filename = entry.path().filename().string();
@@ -150,8 +163,20 @@ void smalldb::load_sstables() {
   std::sort(files.begin(), files.end(),
             [](const auto& a, const auto& b) { return a.first > b.first; });
 
-  for (const auto& file : files) {
-    sstable_files_.push_back(file.second);
+  // Rebuild bloom filters for existing SSTables
+  for (const auto& [num, filepath] : files) {
+    sstable_files_.push_back(filepath);
+
+    // Read SSTable and rebuild bloom filter
+    auto data = ss_table::read_all(filepath);
+    auto filter = std::make_unique<bloom_filter>(
+        data.size() > 0 ? data.size() : 1,
+        0.01
+    );
+    for (const auto& [key, value] : data) {
+      filter->add(slice(key));
+    }
+    sstable_bloom_filters_.push_back({filepath, std::move(filter)});
   }
 
   std::cout << "Loaded " << sstable_files_.size() << " SSTables" << std::endl;

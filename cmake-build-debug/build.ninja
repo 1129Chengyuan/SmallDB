@@ -77,6 +77,27 @@ build CMakeFiles/SmallDB.dir/ss_table.cpp.o: CXX_COMPILER__SmallDB_unscanned_Deb
   OBJECT_DIR = CMakeFiles/SmallDB.dir
   OBJECT_FILE_DIR = CMakeFiles/SmallDB.dir
 
+build CMakeFiles/SmallDB.dir/compaction.cpp.o: CXX_COMPILER__SmallDB_unscanned_Debug /Users/chengyuanli/Desktop/SmallDB/compaction.cpp || cmake_object_order_depends_target_SmallDB
+  CONFIG = Debug
+  DEP_FILE = CMakeFiles/SmallDB.dir/compaction.cpp.o.d
+  FLAGS = -g -std=gnu++20 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -fcolor-diagnostics
+  OBJECT_DIR = CMakeFiles/SmallDB.dir
+  OBJECT_FILE_DIR = CMakeFiles/SmallDB.dir
+
+build CMakeFiles/SmallDB.dir/smalldb.cpp.o: CXX_COMPILER__SmallDB_unscanned_Debug /Users/chengyuanli/Desktop/SmallDB/smalldb.cpp || cmake_object_order_depends_target_SmallDB
+  CONFIG = Debug
+  DEP_FILE = CMakeFiles/SmallDB.dir/smalldb.cpp.o.d
+  FLAGS = -g -std=gnu++20 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -fcolor-diagnostics
+  OBJECT_DIR = CMakeFiles/SmallDB.dir
+  OBJECT_FILE_DIR = CMakeFiles/SmallDB.dir
+
+build CMakeFiles/SmallDB.dir/bloom_filter.cpp.o: CXX_COMPILER__SmallDB_unscanned_Debug /Users/chengyuanli/Desktop/SmallDB/bloom_filter.cpp || cmake_object_order_depends_target_SmallDB
+  CONFIG = Debug
+  DEP_FILE = CMakeFiles/SmallDB.dir/bloom_filter.cpp.o.d
+  FLAGS = -g -std=gnu++20 -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk -fcolor-diagnostics
+  OBJECT_DIR = CMakeFiles/SmallDB.dir
+  OBJECT_FILE_DIR = CMakeFiles/SmallDB.dir
+
 
 # =============================================================================
 # Link build statements for EXECUTABLE target SmallDB
@@ -85,7 +106,7 @@ build CMakeFiles/SmallDB.dir/ss_table.cpp.o: CXX_COMPILER__SmallDB_unscanned_Deb
 #############################################
 # Link the executable SmallDB
 
-build SmallDB: CXX_EXECUTABLE_LINKER__SmallDB_Debug CMakeFiles/SmallDB.dir/main.cpp.o CMakeFiles/SmallDB.dir/mem_table.cpp.o CMakeFiles/SmallDB.dir/WAL.cpp.o CMakeFiles/SmallDB.dir/ss_table.cpp.o
+build SmallDB: CXX_EXECUTABLE_LINKER__SmallDB_Debug CMakeFiles/SmallDB.dir/main.cpp.o CMakeFiles/SmallDB.dir/mem_table.cpp.o CMakeFiles/SmallDB.dir/WAL.cpp.o CMakeFiles/SmallDB.dir/ss_table.cpp.o CMakeFiles/SmallDB.dir/compaction.cpp.o CMakeFiles/SmallDB.dir/smalldb.cpp.o CMakeFiles/SmallDB.dir/bloom_filter.cpp.o
   CONFIG = Debug
   FLAGS = -g -arch arm64 -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX15.4.sdk
   LINK_FLAGS = -Wl,-search_paths_first -Wl,-headerpad_max_install_names

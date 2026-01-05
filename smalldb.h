@@ -5,6 +5,7 @@
 #include "wal.h"
 #include "ss_table.h"
 #include "slice.h"
+#include "bloom_filter.h"
 #include <string>
 #include <vector>
 #include <memory>
@@ -52,6 +53,10 @@ private:
   int sstable_counter_;
 
   static constexpr size_t COMPACTION_THRESHOLD = 4;
+
+  // Bloom filter metadata for each ss_table
+  std::vector<std::pair<std::string, std::unique_ptr<bloom_filter>>> sstable_bloom_filters_;
+
 };
 
 #endif // SMALLDB_SMALLDB_H

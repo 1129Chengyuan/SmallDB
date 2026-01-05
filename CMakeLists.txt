@@ -15,4 +15,6 @@ add_executable(SmallDB main.cpp
         compaction.h
         smalldb.cpp
         smalldb.h
+        bloom_filter.cpp
+        bloom_filter.h
 )
