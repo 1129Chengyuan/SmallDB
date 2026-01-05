@@ -1,6 +1,11 @@
 **Issues**  
-get() is O(m*n), which is super slow since worst case is multiple I/O reads  
-during compaction everything is fit into RAM, which is a gigantic memory pressure  
+get() is O(m*n), which is super slow since worst case is multiple I/O reads // FIXED WITH BLOOM FILTERS!!    
+// TO BE FIXED  
+Searching is insanely slow due to potentially O(n) I/O accesses (sparse index)    
+during compaction everything is fit into RAM, which is a gigantic memory pressure (streaming merge)  
+put() operations may seem to freeze if compaction needs to happen during the write (concurrency, threading)  
+what if the db crashes during a write to the WAL? (checksum, but may slow down database initialization)  
+
 
 **Completed**  
 mem_table  
@@ -9,11 +14,11 @@ wal
 ss_table  
 compaction  
 smalldb  
+bloom_filter
 
 **In Progress**  
   
 **Not Started**  
-Bloom filters  
 Streaming merge  
 
 **Performance (no bloom, no streaming merge)**  
