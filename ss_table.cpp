@@ -3,6 +3,86 @@
 #include <iostream>
 #include <algorithm>
 
+// ============================================================================
+// SSTableIterator Implementation
+// ============================================================================
+
+SSTableIterator::SSTableIterator(const std::string& filename)
+    : filename_(filename), valid_(false) {
+  file_.open(filename_, std::ios::binary);
+  if (!file_.is_open()) {
+    std::cerr << "Failed to open SSTable for iteration: " << filename_ << std::endl;
+    return;
+  }
+  // Read first entry
+  valid_ = read_next();
+}
+
+SSTableIterator::~SSTableIterator() {
+  if (file_.is_open()) {
+    file_.close();
+  }
+}
+
+bool SSTableIterator::next() {
+  if (!valid_) {
+    return false;
+  }
+  valid_ = read_next();
+  return valid_;
+}
+
+bool SSTableIterator::valid() const {
+  return valid_;
+}
+
+std::string SSTableIterator::key() const {
+  return current_key_;
+}
+
+std::string SSTableIterator::value() const {
+  return current_value_;
+}
+
+void SSTableIterator::seek_to_first() {
+  file_.clear();
+  file_.seekg(0, std::ios::beg);
+  valid_ = read_next();
+}
+
+bool SSTableIterator::read_next() {
+  if (!file_.is_open()) {
+    return false;
+  }
+
+  size_t key_size, value_size;
+  
+  if (!file_.read(reinterpret_cast<char*>(&key_size), sizeof(size_t))) {
+    return false; // EOF or error
+  }
+  
+  if (!file_.read(reinterpret_cast<char*>(&value_size), sizeof(size_t))) {
+    return false;
+  }
+
+  current_key_.resize(key_size);
+  current_value_.resize(value_size);
+
+  if (!file_.read(&current_key_[0], key_size)) {
+    return false;
+  }
+
+  if (!file_.read(&current_value_[0], value_size)) {
+    return false;
+  }
+
+  return true;
+}
+
+// ============================================================================
+// ss_table Implementation
+// ============================================================================
+
 ss_table::ss_table(const std::string &file_name) {
   file_name_ = file_name;
   load_index();

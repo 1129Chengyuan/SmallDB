@@ -75,34 +75,41 @@ void smalldb::compact() {
     return;
   }
 
-  std::cout << "Starting compaction of " << sstable_files_.size()
+  std::cout << "Starting streaming compaction of " << sstable_files_.size()
             << " SSTables..." << std::endl;
 
-  std::vector<std::map<std::string, std::string>> tables;
-  for (const auto& file : sstable_files_) {
-    tables.push_back(ss_table::read_all(file));
-  }
-
-  auto merged = compaction::merge(tables);
-
   std::string compacted_file = get_next_sstable_name();
-  ss_table::write_all(compacted_file, merged);
+  
+  // Use streaming merge - no RAM pressure!
+  size_t entries_written = compaction::streaming_merge(sstable_files_, compacted_file);
 
-  delete_old_sstables(sstable_files_);
+  std::vector<std::string> old_files = sstable_files_;
 
   sstable_files_.clear();
   sstable_files_.push_back(compacted_file);
 
   // Rebuild bloom filter for compacted SSTable
+  // We need to scan the file once to build the bloom filter
   sstable_bloom_filters_.clear();
-  auto filter = std::make_unique<bloom_filter>(merged.size(), 0.01);
-  for (const auto& [key, value] : merged) {
-    filter->add(slice(key));
+  auto filter = std::make_unique<bloom_filter>(
+      entries_written > 0 ? entries_written : 1, 
+      0.01
+  );
+  
+  // Use iterator to build bloom filter without loading all data
+  SSTableIterator it(compacted_file);
+  while (it.valid()) {
+    filter->add(slice(it.key()));
+    it.next();
   }
+  
   sstable_bloom_filters_.push_back({compacted_file, std::move(filter)});
 
-  std::cout << "Compaction complete. Created " << compacted_file << std::endl;
-  std::cout << "Compacted data contains " << merged.size() << " entries" << std::endl;
+  // Delete old SSTables
+  delete_old_sstables(old_files);
+
+  std::cout << "Streaming compaction complete. Created " << compacted_file << std::endl;
+  std::cout << "Compacted data contains " << entries_written << " entries" << std::endl;
 }
 
 size_t smalldb::get_memtable_size() const {
@@ -163,9 +170,16 @@ void smalldb::load_sstables() {
   std::sort(files.begin(), files.end(),
             [](const auto& a, const auto& b) { return a.first > b.first; });
 
-  // Rebuild bloom filters for existing SSTables
+  // Rebuild bloom filters and check for index files
   for (const auto& [num, filepath] : files) {
     sstable_files_.push_back(filepath);
+
+    // Check if index file exists, rebuild if missing
+    std::string index_path = filepath.substr(0, filepath.find_last_of('.')) + ".idx";
+    if (!fs::exists(index_path)) {
+      std::cout << "Building missing index for " << filepath << std::endl;
+      ss_table::build_index(filepath);
+    }
 
     // Read SSTable and rebuild bloom filter
     auto data = ss_table::read_all(filepath);
@@ -208,6 +222,11 @@ void smalldb::delete_old_sstables(const std::vector<std::string>& files) {
   for (const auto& file : files) {
     try {
       fs::remove(file);
+      // Also delete the corresponding index file
+      std::string index_file = file.substr(0, file.find_last_of('.')) + ".idx";
+      if (fs::exists(index_file)) {
+        fs::remove(index_file);
+      }
     } catch (const std::exception& e) {
       std::cerr << "Failed to delete " << file << ": " << e.what() << std::endl;
     }

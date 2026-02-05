@@ -4,6 +4,8 @@
 #include <string>
 #include <map>
 #include <vector>
+#include <fstream>
+#include <optional>
 #include "slice.h"
 #include "mem_table.h"
 
@@ -11,6 +13,38 @@
 struct IndexEntry {
   std::string key;
   size_t offset;  // byte offset in the SSTable file
+};
+
+// Iterator for streaming reads from SSTable
+class SSTableIterator {
+public:
+  SSTableIterator(const std::string& filename);
+  ~SSTableIterator();
+
+  // Move to next entry
+  bool next();
+
+  // Check if iterator is valid
+  bool valid() const;
+
+  // Get current key (only valid if valid() == true)
+  std::string key() const;
+
+  // Get current value (only valid if valid() == true)
+  std::string value() const;
+
+  // Seek to beginning
+  void seek_to_first();
+
+private:
+  std::string filename_;
+  std::ifstream file_;
+  bool valid_;
+  std::string current_key_;
+  std::string current_value_;
+
+  // Read next entry from file
+  bool read_next();
 };
 
 class ss_table {
