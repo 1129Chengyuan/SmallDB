@@ -2,7 +2,6 @@
  
 
 // TO BE FIXED  
-during compaction everything is fit into RAM, which is a gigantic memory pressure (streaming merge)  
 put() operations may seem to freeze if compaction needs to happen during the write (concurrency, threading)  
 what if the db crashes during a write to the WAL? (checksum, but may slow down database initialization)  
 
@@ -10,6 +9,7 @@ what if the db crashes during a write to the WAL? (checksum, but may slow down d
 // FIXED
 get() is O(m*n), which is super slow since worst case is multiple I/O reads // FIXED WITH BLOOM FILTERS!!   
 Searching is insanely slow due to potentially O(n) I/O accesses (sparse index)   
+during compaction everything is fit into RAM, which is a gigantic memory pressure (streaming merge)  
 
 
 **Completed**  
@@ -68,3 +68,16 @@ Streaming merge
 ║ Large Values (102400 bytes)         |       50 ops |     389.22 ms |        128 ops/s |  7784.30 µs |    33.15 ms
 ║ WAL Recovery (2500 entries)         |     2500 ops |      28.66 ms |      87222 ops/s |    11.47 µs |     1.42 ms
 
+**With Streaming MErge**
+║ Sequential Writes                   |     5000 ops |     214.32 ms |      23329 ops/s |    42.86 µs |    11.55 ms
+║ Random Writes                       |     5000 ops |     236.03 ms |      21184 ops/s |    47.21 µs |     9.33 ms
+║ Sequential Reads                    |     5000 ops |     491.05 ms |      10182 ops/s |    98.21 µs |    12.91 ms
+║ Random Reads                        |     5000 ops |     498.69 ms |      10026 ops/s |    99.74 µs |    16.60 ms
+║ Updates (Overwrites)                |     2500 ops |      94.46 ms |      26465 ops/s |    37.79 µs |     9.74 ms
+║ Deletions                           |     2500 ops |     114.98 ms |      21743 ops/s |    45.99 µs |    26.05 ms
+║ Mixed Workload (50% R/W)            |     5000 ops |     323.23 ms |      15469 ops/s |    64.65 µs |    19.07 ms
+║ Compaction (8 SSTables)             |        1 ops |      84.98 ms |         12 ops/s | 84983.00 µs |    12.75 ms
+║ Large Values (1024 bytes)           |      500 ops |      53.32 ms |       9378 ops/s |   106.64 µs |     1.04 ms
+║ Large Values (10240 bytes)          |      500 ops |     755.15 ms |        662 ops/s |  1510.31 µs |    15.24 ms
+║ Large Values (102400 bytes)         |       50 ops |     369.92 ms |        135 ops/s |  7398.43 µs |    15.84 ms
+║ WAL Recovery (2500 entries)         |     2500 ops |      28.28 ms |      88387 ops/s |    11.31 µs |     0.64 ms
