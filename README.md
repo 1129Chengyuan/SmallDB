@@ -1,12 +1,16 @@
 **Issues**  
-get() is O(m*n), which is super slow since worst case is multiple I/O reads // FIXED WITH BLOOM FILTERS!!    
+ 
+
 // TO BE FIXED  
-Searching is insanely slow due to potentially O(n) I/O accesses (sparse index)    
 during compaction everything is fit into RAM, which is a gigantic memory pressure (streaming merge)  
 put() operations may seem to freeze if compaction needs to happen during the write (concurrency, threading)  
 what if the db crashes during a write to the WAL? (checksum, but may slow down database initialization)  
 
-REDO SPARSE INDEXES BECAUSE THEY MAKE THE CODE SLOWER
+
+// FIXED
+get() is O(m*n), which is super slow since worst case is multiple I/O reads // FIXED WITH BLOOM FILTERS!!   
+Searching is insanely slow due to potentially O(n) I/O accesses (sparse index)   
+
 
 **Completed**  
 mem_table  
@@ -51,17 +55,16 @@ Streaming merge
 ║ WAL Recovery (2500 entries)         |     2500 ops |     152.17 ms |      16429 ops/s |    60.87 µs |    75.79 ms  
 
 **With Sparse Indexes:**  
-║ Sequential Writes                   |     5000 ops |     781.05 ms |       6402 ops/s |   156.21 µs |     2.01 ms
-║ Random Writes                       |     5000 ops |     855.91 ms |       5842 ops/s |   171.18 µs |     4.98 ms
-║ Sequential Reads                    |     5000 ops |   55947.13 ms |         89 ops/s | 11189.43 µs | 11880.93 ms
-║ Random Reads                        |     5000 ops |   51686.42 ms |         97 ops/s | 10337.28 µs |   604.72 ms
-║ Updates (Overwrites)                |     2500 ops |     245.01 ms |      10204 ops/s |    98.00 µs |     2.35 ms
-║ Deletions                           |     2500 ops |     307.43 ms |       8132 ops/s |   122.97 µs |    12.15 ms
-║ Mixed Workload (50% R/W)            |     5000 ops |   15483.75 ms |        323 ops/s |  3096.75 µs |   562.12 ms
-║ Compaction (8 SSTables)             |        1 ops |     139.00 ms |          7 ops/s | 139000.55 µs |     5.19 ms
-║ Large Values (1024 bytes)           |      500 ops |     100.34 ms |       4983 ops/s |   200.67 µs |     2.17 ms
-║ Large Values (10240 bytes)          |      500 ops |    1327.28 ms |        377 ops/s |  2654.55 µs |    24.91 ms
-║ Large Values (102400 bytes)         |       50 ops |     646.64 ms |         77 ops/s | 12932.80 µs |    14.65 ms
-║ WAL Recovery (2500 entries)         |     2500 ops |      50.29 ms |      49710 ops/s |    20.12 µs |     4.09 ms
-
+║ Sequential Writes                   |     5000 ops |     393.32 ms |      12712 ops/s |    78.66 µs |    11.46 ms
+║ Random Writes                       |     5000 ops |     430.22 ms |      11622 ops/s |    86.04 µs |    10.94 ms
+║ Sequential Reads                    |     5000 ops |     674.92 ms |       7408 ops/s |   134.98 µs |    19.68 ms
+║ Random Reads                        |     5000 ops |     674.08 ms |       7417 ops/s |   134.82 µs |    14.02 ms
+║ Updates (Overwrites)                |     2500 ops |     141.64 ms |      17650 ops/s |    56.66 µs |    16.04 ms
+║ Deletions                           |     2500 ops |     162.60 ms |      15375 ops/s |    65.04 µs |     9.22 ms
+║ Mixed Workload (50% R/W)            |     5000 ops |     462.70 ms |      10806 ops/s |    92.54 µs |    22.70 ms
+║ Compaction (8 SSTables)             |        1 ops |     115.32 ms |          9 ops/s | 115317.23 µs |    21.07 ms
+║ Large Values (1024 bytes)           |      500 ops |      60.96 ms |       8202 ops/s |   121.91 µs |     3.94 ms
+║ Large Values (10240 bytes)          |      500 ops |     793.35 ms |        630 ops/s |  1586.71 µs |     7.70 ms
+║ Large Values (102400 bytes)         |       50 ops |     389.22 ms |        128 ops/s |  7784.30 µs |    33.15 ms
+║ WAL Recovery (2500 entries)         |     2500 ops |      28.66 ms |      87222 ops/s |    11.47 µs |     1.42 ms
 
