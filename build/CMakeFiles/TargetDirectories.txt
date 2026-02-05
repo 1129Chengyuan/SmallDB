@@ -1,0 +1,3 @@
+/Users/chengyuanli/Desktop/SmallDB/build/CMakeFiles/SmallDB.dir
+/Users/chengyuanli/Desktop/SmallDB/build/CMakeFiles/edit_cache.dir
+/Users/chengyuanli/Desktop/SmallDB/build/CMakeFiles/rebuild_cache.dir

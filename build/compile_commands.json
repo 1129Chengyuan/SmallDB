@@ -1,0 +1,44 @@
+[
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/main.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/main.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/main.cpp",
+  "output": "CMakeFiles/SmallDB.dir/main.cpp.o"
+},
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/mem_table.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/mem_table.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/mem_table.cpp",
+  "output": "CMakeFiles/SmallDB.dir/mem_table.cpp.o"
+},
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/WAL.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/WAL.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/WAL.cpp",
+  "output": "CMakeFiles/SmallDB.dir/WAL.cpp.o"
+},
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/ss_table.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/ss_table.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/ss_table.cpp",
+  "output": "CMakeFiles/SmallDB.dir/ss_table.cpp.o"
+},
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/compaction.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/compaction.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/compaction.cpp",
+  "output": "CMakeFiles/SmallDB.dir/compaction.cpp.o"
+},
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/smalldb.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/smalldb.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/smalldb.cpp",
+  "output": "CMakeFiles/SmallDB.dir/smalldb.cpp.o"
+},
+{
+  "directory": "/Users/chengyuanli/Desktop/SmallDB/build",
+  "command": "/usr/bin/clang++ -g -std=gnu++20 -arch arm64 -o CMakeFiles/SmallDB.dir/bloom_filter.cpp.o -c /Users/chengyuanli/Desktop/SmallDB/bloom_filter.cpp",
+  "file": "/Users/chengyuanli/Desktop/SmallDB/bloom_filter.cpp",
+  "output": "CMakeFiles/SmallDB.dir/bloom_filter.cpp.o"
+}
+]

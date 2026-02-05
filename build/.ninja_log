@@ -1,0 +1,9 @@
+# ninja log v6
+2	657	1770262316595237875	CMakeFiles/SmallDB.dir/bloom_filter.cpp.o	92e0b89dc850b150
+1	737	1770262316594453898	CMakeFiles/SmallDB.dir/mem_table.cpp.o	25e6bf249b5d8382
+1	791	1770262316594770389	CMakeFiles/SmallDB.dir/compaction.cpp.o	31112bd846c672d6
+1	840	1770262316594565853	CMakeFiles/SmallDB.dir/WAL.cpp.o	eab7cbd96e98fc8a
+1	904	1770262316594667808	CMakeFiles/SmallDB.dir/ss_table.cpp.o	22980d40c964e7fa
+1	983	1770262316594877344	CMakeFiles/SmallDB.dir/smalldb.cpp.o	6265ec352ef5352c
+1	1100	1770262316594220612	CMakeFiles/SmallDB.dir/main.cpp.o	3328b2f731d0f48c
+1100	1249	1770262317693328416	SmallDB	5f58adc34b1d4227
