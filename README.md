@@ -81,3 +81,17 @@ Streaming merge
 ║ Large Values (10240 bytes)          |      500 ops |     755.15 ms |        662 ops/s |  1510.31 µs |    15.24 ms
 ║ Large Values (102400 bytes)         |       50 ops |     369.92 ms |        135 ops/s |  7398.43 µs |    15.84 ms
 ║ WAL Recovery (2500 entries)         |     2500 ops |      28.28 ms |      88387 ops/s |    11.31 µs |     0.64 ms
+
+**With Background Compaction**
+║ Sequential Writes                   |     5000 ops |      94.57 ms |      52874 ops/s |    18.91 µs |    10.15 ms
+║ Random Writes                       |     5000 ops |      94.86 ms |      52707 ops/s |    18.97 µs |    17.17 ms
+║ Sequential Reads                    |     5000 ops |     322.27 ms |      15515 ops/s |    64.45 µs |    10.54 ms
+║ Random Reads                        |     5000 ops |     328.05 ms |      15241 ops/s |    65.61 µs |    14.75 ms
+║ Updates (Overwrites)                |     2500 ops |      61.31 ms |      40776 ops/s |    24.52 µs |     1.82 ms
+║ Deletions                           |     2500 ops |      69.41 ms |      36019 ops/s |    27.76 µs |    11.04 ms
+║ Mixed Workload (50% R/W)            |     5000 ops |     221.84 ms |      22538 ops/s |    44.37 µs |     9.99 ms
+║ Compaction (8 SSTables)             |        1 ops |      53.68 ms |         19 ops/s | 53677.91 µs |    10.76 ms
+║ Large Values (1024 bytes)           |      500 ops |      46.05 ms |      10858 ops/s |    92.09 µs |    12.70 ms
+║ Large Values (10240 bytes)          |      500 ops |     392.56 ms |       1274 ops/s |   785.13 µs |    16.06 ms
+║ Large Values (102400 bytes)         |       50 ops |     317.97 ms |        157 ops/s |  6359.49 µs |    22.17 ms
+║ WAL Recovery (2500 entries)         |     2500 ops |      28.84 ms |      86696 ops/s |    11.53 µs |     1.36 ms
