@@ -1,7 +1,9 @@
 #include "ss_table.h"
+#include "log.h"
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include "file_util.h"
 
 // ============================================================================
 // SSTableIterator Implementation
@@ -11,7 +13,7 @@ SSTableIterator::SSTableIterator(const std::string& filename)
     : filename_(filename), valid_(false) {
   file_.open(filename_, std::ios::binary);
   if (!file_.is_open()) {
-    std::cerr << "Failed to open SSTable for iteration: " << filename_ << std::endl;
+    smalldb_log::error("Failed to open SSTable for iteration: ", filename_);
     return;
   }
   // Read first entry
@@ -124,14 +126,14 @@ void ss_table::load_index() {
   input.close();
 }
 
-void ss_table::build_index(const std::string& sstable_file, size_t index_interval) {
+bool ss_table::build_index(const std::string& sstable_file, size_t index_interval) {
   std::string index_file = get_index_file_path(sstable_file);
   std::ifstream input(sstable_file, std::ios::binary);
-  std::ofstream output(index_file, std::ios::binary);
+  std::ofstream output(index_file, std::ios::binary | std::ios::trunc);
   
   if (!input.is_open() || !output.is_open()) {
-    std::cerr << "Failed to build index for " << sstable_file << std::endl;
-    return;
+    smalldb_log::error("Failed to build index for ", sstable_file);
+    return false;
   }
   
   size_t entry_count = 0;
@@ -165,6 +167,11 @@ void ss_table::build_index(const std::string& sstable_file, size_t index_interva
   
   input.close();
   output.close();
+  if (!output) {
+    smalldb_log::error("Failed to write index ", index_file);
+    return false;
+  }
+  return file_util::sync_file(index_file);
 }
 
 size_t ss_table::find_scan_start_offset(const slice& key) const {
@@ -191,12 +198,12 @@ size_t ss_table::find_scan_start_offset(const slice& key) const {
   return 0;
 }
 
-void ss_table::flush_memtable(const mem_table &mem_table,
+bool ss_table::flush_memtable(const mem_table &mem_table,
                               const std::string &file_name) {
-  std::ofstream output_stream(file_name, std::ios::binary);
+  std::ofstream output_stream(file_name, std::ios::binary | std::ios::trunc);
   if (!output_stream.is_open()) {
-    std::cout << file_name << "Failed to create ss_table from mem_table" << std::endl;
-    return;
+    smalldb_log::error(file_name, ": failed to create ss_table from mem_table");
+    return false;
   }
   const auto &data = mem_table.getData();
   for (const auto &pair : data) {
@@ -209,14 +216,24 @@ void ss_table::flush_memtable(const mem_table &mem_table,
     output_stream.write(pair.second.data(), value_size);
   }
   output_stream.close();
-  
+  if (!output_stream) {
+    smalldb_log::error(file_name, ": failed to write ss_table");
+    return false;
+  }
+
+  // Durable before the caller truncates the WAL that backs this data
+  if (!file_util::sync_file(file_name)) {
+    smalldb_log::error(file_name, ": fsync failed");
+    return false;
+  }
+
   // Build index after writing SSTable
-  build_index(file_name);
+  return build_index(file_name);
 }
 
-std::string ss_table::get(const slice &key) const {
+std::optional<std::string> ss_table::get(const slice &key) const {
   std::ifstream input_stream(file_name_, std::ios::binary);
-  if (!input_stream.is_open()) return "";
+  if (!input_stream.is_open()) return std::nullopt;
 
   // Use sparse index to skip to the right area
   size_t start_offset = find_scan_start_offset(key);
@@ -242,14 +259,14 @@ std::string ss_table::get(const slice &key) const {
     } else if (cmp > 0) {
       // We've gone past the key (SSTables are sorted), so it doesn't exist
       input_stream.close();
-      return "";
+      return std::nullopt;
     } else {
       // Keep scanning forward
       input_stream.seekg(value_size, std::ios::cur);
     }
   }
   input_stream.close();
-  return "";
+  return std::nullopt;
 }
 
 std::map<std::string, std::string> ss_table::read_all(const std::string& file_name) {
@@ -281,7 +298,7 @@ void ss_table::write_all(const std::string& file_name, const std::map<std::strin
   std::ofstream output(file_name, std::ios::binary);
 
   if (!output.is_open()) {
-    std::cerr << "Failed to create SSTable: " << file_name << std::endl;
+    smalldb_log::error("Failed to create SSTable: ", file_name);
     return;
   }
 

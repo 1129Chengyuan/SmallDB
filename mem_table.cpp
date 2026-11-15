@@ -39,6 +39,15 @@ std::string mem_table::get(const slice& key) const {
   return "";
 }
 
+bool mem_table::find(const slice& key, std::string& value) const {
+  auto iterator = table.find(key.toString());
+  if (iterator == table.end()) {
+    return false;
+  }
+  value = iterator->second;
+  return true;
+}
+
 void mem_table::remove(const slice& key) {
   this->set(key, slice(tombstone));
 }

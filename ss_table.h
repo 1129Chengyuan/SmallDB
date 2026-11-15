@@ -51,9 +51,11 @@ class ss_table {
 public:
   ss_table(const std::string& file_name);
 
-  static void flush_memtable(const mem_table& mem_table, const std::string& file_name);
+  // Writes and fsyncs the table and its index. Returns false on any I/O error.
+  static bool flush_memtable(const mem_table& mem_table, const std::string& file_name);
 
-  std::string get(const slice& key) const;
+  // nullopt if the key isn't in this table. A stored tombstone is returned as-is.
+  std::optional<std::string> get(const slice& key) const;
 
   static std::map<std::string, std::string> read_all(const std::string& file_name);
 
@@ -62,8 +64,8 @@ public:
   // Load sparse index from index file
   void load_index();
 
-  // Build and save sparse index for an SSTable
-  static void build_index(const std::string& sstable_file, size_t index_interval = 32);
+  // Build, save and fsync sparse index for an SSTable. Returns false on I/O error.
+  static bool build_index(const std::string& sstable_file, size_t index_interval = 32);
 
 private:
   std::string file_name_;

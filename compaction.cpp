@@ -1,10 +1,13 @@
 #include "compaction.h"
+#include "log.h"
 #include "mem_table.h"
 #include "ss_table.h"
 #include <queue>
 #include <fstream>
 #include <memory>
 #include <iostream>
+#include <filesystem>
+#include "file_util.h"
 
 // Helper to track an entry and which SSTable it belongs to
 struct MergeEntry {
@@ -17,7 +20,8 @@ struct MergeEntry {
         if (key != other.key) {
             return key > other.key;
         }
-        // If keys are equal, higher table_index is more recent
+        // If keys are equal, the LOWER table_index is more recent (tables are
+        // ordered newest first), so it must pop first from the min-heap
         return table_index > other.table_index;
     }
 };
@@ -77,13 +81,20 @@ std::map<std::string, std::string> compaction::merge(const std::vector<std::map<
 }
 
 // New streaming merge - only keeps iterators in memory, not all data!
-size_t compaction::streaming_merge(const std::vector<std::string>& sstable_files, 
+std::optional<size_t> compaction::streaming_merge(const std::vector<std::string>& sstable_files, 
                                     const std::string& output_file) {
+    auto fail = [&](const std::string& why) -> std::optional<size_t> {
+        smalldb_log::error("Compaction failed (", why, "): ", output_file);
+        std::error_code ec;
+        std::filesystem::remove(output_file, ec);
+        std::filesystem::remove(output_file.substr(0, output_file.find_last_of('.')) + ".idx", ec);
+        return std::nullopt;
+    };
+
     // Open output file for writing
-    std::ofstream output(output_file, std::ios::binary);
+    std::ofstream output(output_file, std::ios::binary | std::ios::trunc);
     if (!output.is_open()) {
-        std::cerr << "Failed to open output file: " << output_file << std::endl;
-        return 0;
+        return fail("cannot open output");
     }
 
     // Create iterators for each input SSTable
@@ -97,6 +108,9 @@ size_t compaction::streaming_merge(const std::vector<std::string>& sstable_files
 
     if (iterators.empty()) {
         output.close();
+        if (!output || !file_util::sync_file(output_file) || !ss_table::build_index(output_file)) {
+            return fail("write error");
+        }
         return 0;
     }
 
@@ -153,9 +167,17 @@ size_t compaction::streaming_merge(const std::vector<std::string>& sstable_files
     }
 
     output.close();
+    if (!output) {
+        return fail("write error");
+    }
+    if (!file_util::sync_file(output_file)) {
+        return fail("fsync error");
+    }
 
     // Build index for the output file
-    ss_table::build_index(output_file);
+    if (!ss_table::build_index(output_file)) {
+        return fail("index error");
+    }
 
     return entries_written;
 }

@@ -17,6 +17,10 @@ public:
 
   std::string get(const slice& key) const;
 
+  // Raw lookup: true if the key has an entry here (a tombstone counts), with the
+  // stored value copied into `value`. Lets callers tell "deleted" from "absent".
+  bool find(const slice& key, std::string& value) const;
+
   void remove(const slice& key);
 
   bool isFull() const;
