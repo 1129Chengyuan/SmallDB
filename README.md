@@ -12,7 +12,7 @@ Essentially, LSM-Tree databases are crash-pessimistic databases used for high th
 * **Write Path**: Data is first appended to a **Write-Ahead Log (WAL)** for durability. It is then inserted into an in-memory **MemTable**, a data structure (any balanced tree or skip list works but in this case I used a red-black tree) used to keep the data in sorted order.
 * **Flush**: Once the MemTable reaches a certain size threshold, it is flushed to disk as a sorted **SSTable** file.
 * **Compaction:** Every so often SSTables are merged together in a process called compaction, which maintains the sorted order of SSTables and takes only the most recent value from the SSTables if the keys are identical.
-* **Read Path**: Lookups check the MemTable first, then proceed through SSTables from newest to oldest.
+* **Read Path**: Lookups check the MemTable first, then proceed through SSTables from newest to oldest. Each SSTable is kept open in a **table cache** (index, bloom filter and file descriptor in memory), so a lookup costs at most one disk read per table.
 * **Delete Path:** The same as the write path, but I use a "tombstone" marker to mark the key as deleted. When merging the tombstone will force the compaction to ignore the value.
 ---
 
@@ -22,11 +22,16 @@ Essentially, LSM-Tree databases are crash-pessimistic databases used for high th
 | --- | --- |
 | `smalldb.cpp/h` | Coordinates MemTable, WAL, and SSTable management. |
 | `mem_table.cpp/h` | In-memory Red-Black Tree (`std::map`) providing  access. |
-| `WAL.cpp/h` | Handles the append-only log for crash recovery. |
+| `wal.cpp/h` | Handles the append-only log for crash recovery, with a CRC32 checksum on every record. |
 | `ss_table.cpp/h` | Manages "Sorted String Tables" on disk, including binary format and indexing. |
 | `bloom_filter.cpp/h` | Probabilistic bitset used to skip SSTables that definitely don't contain a key. |
 | `compaction.cpp/h` | Merges multiple SSTables, discarding stale keys and tombstones. |
 | `slice.h` | Lightweight wrapper for pointers/lengths to avoid `std::string` copy overhead. |
+| `crc32.h` | CRC32 checksum used to detect torn or corrupted WAL records. |
+| `file_util.h` | `fsync` helpers so flushed data actually reaches the disk. |
+| `log.h` | Thread-safe logging (the client thread and the compaction thread both log). |
+| `kv_engine.h` | Common interface so the same benchmark can drive SmallDB and RocksDB. |
+| `tests/smalldb_test.cpp` | Crash-recovery tests, SSTable edge cases, and a randomized test against `std::map`. |
 
 ---
 ### Performance Evolution & Optimizations
@@ -39,6 +44,15 @@ I implemented the following features to resolve these issues:
 2. **Sparse Indexing:** To fix the slow search times caused by linear I/O scans, I added a sparse index. This allows the engine to jump to specific blocks within an SSTable rather than reading the whole file.
 3. **Streaming Merge:** Originally, compaction loaded all SSTable data into RAM simultaneously, creating massive memory pressure. I refactored this into a Streaming Merge using a Min-Heap.
 4. **Background Compaction:** To prevent put() operations from freezing when a flush or compaction is triggered, I moved these tasks to a background thread.
+5. **Crash Safety & Correctness Fixes:** I wrote a randomized test that runs the same operations against SmallDB and a `std::map`, plus tests that simulate crashes. They exposed several bugs that could lose or resurrect data:
+   * Deleted keys still in the MemTable returned their old value from disk.
+   * Background compaction dropped SSTables that were flushed while it was merging.
+   * The SSTable file counter was shared between threads without synchronization.
+   * A crash mid-compaction could bring deleted keys back.
+   * A half-written WAL record crashed recovery.
+
+   I fixed them with a **MANIFEST** file (written atomically with write-temp + `fsync` + rename) that records which SSTables are live, **CRC32 checksums** on WAL records, and `fsync` before the WAL is cleared. All tests also pass under ThreadSanitizer.
+6. **Table Cache:** Profiling showed ~80% of every `get()` was system calls (`open` 35%, `read` 35%, `lseek` 11%): each lookup reopened the SSTable, re-parsed its whole index file and closed everything again. Now each SSTable is opened once and its index, bloom filter, key range and file descriptor stay in memory. A lookup checks the key range and bloom filter, binary-searches the in-memory index, and reads the one matching chunk with a single `pread`. **Random reads went from 46 µs to 0.66 µs (~70x).** Since SSTables are immutable, the cache never needs invalidating; tables are reference-counted, so compaction can delete a file while a reader is still using it.
 
 ### Internal Storage Format
 
@@ -53,8 +67,9 @@ SSTables are stored as immutable, sorted files on disk. The data is laid out seq
 * `value_data` (variable length)
 
 
-2. **Sparse Index**: Map specific keys to their byte offsets in the data block to avoid full file scans.
-3. **Bloom Filter**: A serialized bit-array used for membership testing before performing disk I/O.
+2. **Sparse Index** (separate `sstable_N.idx` file): every 32nd key mapped to its byte offset in the data file, so a lookup only has to scan one 32-entry chunk. Loaded into memory once, when the table is opened.
+3. **Bloom Filter**: built in memory when the table is opened (not stored on disk) and used for membership testing before performing disk I/O.
+4. **MANIFEST**: a small file listing the live SSTables, newest first. It's replaced atomically after every flush and compaction, and on startup any SSTable not listed in it is deleted as a leftover from a crash.
 
 ---
 
@@ -167,6 +182,77 @@ Moving compaction to a background thread allowed writes to proceed without waiti
 
 ---
 
+#### With Crash Safety & Correctness Fixes
+
+The benchmark harness was also updated for this version: it now builds in Release mode by default, runs every engine through a common `kv_engine` interface, and compares against RocksDB. Because of that, **these numbers aren't directly comparable to the sections above**. They're the "before" baseline for the table cache below, measured with the same harness. Reads are still slow here (~46 µs), because every lookup reopens and re-parses the SSTable files.
+
+| Benchmark | Operations | Duration | Throughput | Latency |
+| --- | --- | --- | --- | --- |
+| Sequential Writes | 5000 ops | 31.48 ms | 158822 ops/s | 6.30 µs |
+| Random Writes | 5000 ops | 31.72 ms | 157627 ops/s | 6.34 µs |
+| Sequential Reads | 5000 ops | 224.09 ms | 22312 ops/s | 44.82 µs |
+| Random Reads | 5000 ops | 231.25 ms | 21622 ops/s | 46.25 µs |
+| Updates (Overwrites) | 2500 ops | 14.61 ms | 171141 ops/s | 5.84 µs |
+| Deletions | 2500 ops | 4.08 ms | 612277 ops/s | 1.63 µs |
+| Mixed Workload (50% R/W) | 5000 ops | 126.33 ms | 39578 ops/s | 25.27 µs |
+| Full Compaction (4766 keys) | 1 ops | 4.13 ms | 242 ops/s | 4134.75 µs |
+| Large Values (1024 bytes) | 500 ops | 15.64 ms | 31975 ops/s | 31.27 µs |
+| Large Values (10240 bytes) | 500 ops | 169.00 ms | 2959 ops/s | 337.99 µs |
+| Large Values (102400 bytes) | 50 ops | 165.18 ms | 303 ops/s | 3303.62 µs |
+| WAL Recovery (2500 entries) | 2500 ops | 1.39 ms | 1794435 ops/s | 0.56 µs |
+
+---
+
+#### With Table Cache
+
+Keeping each SSTable open with its index in memory removed the file opens and index parsing from every lookup. A read is now one `pread` per candidate table plus in-memory key comparisons. **Reads got ~70x faster and the mixed workload ~7x faster**, while write performance stayed the same. Compaction is slightly slower (4.1 → 5.5 ms, though its run-to-run spread is ±2.9 ms) because opening the output table now loads its index up front, a cost paid once per table instead of on every lookup.
+
+| Benchmark | Operations | Duration | Throughput | Latency |
+| --- | --- | --- | --- | --- |
+| Sequential Writes | 5000 ops | 32.44 ms | 154146 ops/s | 6.49 µs |
+| Random Writes | 5000 ops | 33.00 ms | 151504 ops/s | 6.60 µs |
+| Sequential Reads | 5000 ops | 3.06 ms | **1636086 ops/s** | **0.61 µs** |
+| Random Reads | 5000 ops | 3.30 ms | **1517291 ops/s** | **0.66 µs** |
+| Updates (Overwrites) | 2500 ops | 14.46 ms | 172923 ops/s | 5.78 µs |
+| Deletions | 2500 ops | 3.80 ms | 658407 ops/s | 1.52 µs |
+| Mixed Workload (50% R/W) | 5000 ops | 17.18 ms | **291068 ops/s** | **3.44 µs** |
+| Full Compaction (4766 keys) | 1 ops | 5.53 ms | 181 ops/s | 5530.90 µs |
+| Large Values (1024 bytes) | 500 ops | 15.86 ms | 31534 ops/s | 31.71 µs |
+| Large Values (10240 bytes) | 500 ops | 177.65 ms | 2814 ops/s | 355.31 µs |
+| Large Values (102400 bytes) | 50 ops | 174.77 ms | 286 ops/s | 3495.44 µs |
+| WAL Recovery (2500 entries) | 2500 ops | 1.42 ms | 1763585 ops/s | 0.57 µs |
+
+**Before vs after (same harness):**
+
+| Benchmark | Before | After | Speedup |
+| --- | --- | --- | --- |
+| Random Reads | 46.25 µs | 0.66 µs | ~70x |
+| Sequential Reads | 44.82 µs | 0.61 µs | ~73x |
+| Mixed Workload (50% R/W) | 25.27 µs | 3.44 µs | ~7x |
+
+---
+
+#### RocksDB Reference (same benchmark, same machine)
+
+For context, here's RocksDB run through the same harness (same memtable size, no compression, bloom filters on, WAL not fsync'd per write, matching SmallDB). The whole dataset is ~550 KB and fits in the OS page cache, so this measures in-memory code paths, not disk performance. RocksDB is built for datasets far larger than RAM, which this benchmark doesn't test.
+
+| Benchmark | Operations | Duration | Throughput | Latency |
+| --- | --- | --- | --- | --- |
+| Sequential Writes | 5000 ops | 112.20 ms | 44563 ops/s | 22.44 µs |
+| Random Writes | 5000 ops | 119.08 ms | 41988 ops/s | 23.82 µs |
+| Sequential Reads | 5000 ops | 7.16 ms | 698506 ops/s | 1.43 µs |
+| Random Reads | 5000 ops | 7.60 ms | 657665 ops/s | 1.52 µs |
+| Updates (Overwrites) | 2500 ops | 52.29 ms | 47814 ops/s | 20.91 µs |
+| Deletions | 2500 ops | 15.87 ms | 157505 ops/s | 6.35 µs |
+| Mixed Workload (50% R/W) | 5000 ops | 56.25 ms | 88886 ops/s | 11.25 µs |
+| Full Compaction (4766 keys) | 1 ops | 21.09 ms | 47 ops/s | 21094.12 µs |
+| Large Values (1024 bytes) | 500 ops | 76.73 ms | 6516 ops/s | 153.46 µs |
+| Large Values (10240 bytes) | 500 ops | 1014.20 ms | 493 ops/s | 2028.41 µs |
+| Large Values (102400 bytes) | 50 ops | 524.22 ms | 95 ops/s | 10484.41 µs |
+| WAL Recovery (2500 entries) | 2500 ops | 27.13 ms | 92145 ops/s | 10.85 µs |
+
+---
+
 ### Running the Code
 
 SmallDB uses CMake for building and requires C++20. 
@@ -184,6 +270,9 @@ make
 # Run the database benchmarks
 ./SmallDB
 
+# Run the correctness tests
+./smalldb_tests
+
 ```
 
 The benchmark suite in `main.cpp` automatically generates test data, measures performance across various workloads (sequential, random, mixed), and prints a summary table to the console.
@@ -199,11 +288,13 @@ The benchmark suite in `main.cpp` automatically generates test data, measures pe
 * **Read Optimizations**: Implementation of `bloom_filter` and sparse indexing to resolve slow  I/O reads.
 * **Memory Management**: Transition to a `streaming_merge` for compaction to handle datasets larger than RAM.
 * **Concurrency**: Implementation of background compaction to prevent write operations from freezing.
+* **Crash Safety**: MANIFEST of live SSTables, CRC32-checksummed WAL records, and `fsync` before the WAL is cleared.
+* **Testing**: Crash-recovery tests, SSTable edge-case tests, and a randomized test against `std::map`, all passing under ThreadSanitizer.
+* **Table Cache**: Each SSTable opened once with its index in memory; one `pread` per lookup (~70x faster reads).
 
 #### In Progress
 
-* **Thread Safety**: Refining concurrency and threading for `put()` operations during active background compaction.
-* **Error Handling**: Improving checksum verification in the WAL to ensure database integrity during crash recovery.
+* **Background Flush**: `put()` still writes the SSTable itself when the MemTable fills up. Next step is to freeze the full MemTable and let the background thread flush it.
 
 #### Not Started
 
@@ -224,14 +315,18 @@ The benchmark suite in `main.cpp` automatically generates test data, measures pe
  
 
 // TO BE FIXED  
-put() operations may seem to freeze if compaction needs to happen during the write (concurrency, threading)  
-what if the db crashes during a write to the WAL? (checksum, but may slow down database initialization)  
+put() operations may seem to freeze when the memtable has to be flushed during the write (background flush)  
 
 
 // FIXED
 get() is O(m*n), which is super slow since worst case is multiple I/O reads // FIXED WITH BLOOM FILTERS!!   
 Searching is insanely slow due to potentially O(n) I/O accesses (sparse index)   
 during compaction everything is fit into RAM, which is a gigantic memory pressure (streaming merge)  
+what if the db crashes during a write to the WAL? (CRC32 checksums, recovery stops at the first bad record)  
+deleted keys came back from disk while the tombstone was still in the memtable (memtable find())  
+background compaction lost sstables that were flushed during the merge (only replace the inputs)  
+a crash mid-compaction could resurrect deleted keys (MANIFEST)  
+every get() reopened the sstable and re-read its whole index file (table cache)  
 
 
 **Completed**  
@@ -246,7 +341,8 @@ bloom_filter
 **In Progress**  
   
 **Not Started**  
-Streaming merge  
+Background flush  
+Leveled compaction  
 
 **Performance (no bloom, no sparse index)**  
 ║ Sequential Writes                        |       5000 ops |    1085.90 ms |         4604 ops/s |     217.18 µs/op  
@@ -317,3 +413,31 @@ Streaming merge
 ║ Large Values (10240 bytes)          |      500 ops |     392.56 ms |       1274 ops/s |   785.13 µs |    16.06 ms
 ║ Large Values (102400 bytes)         |       50 ops |     317.97 ms |        157 ops/s |  6359.49 µs |    22.17 ms
 ║ WAL Recovery (2500 entries)         |     2500 ops |      28.84 ms |      86696 ops/s |    11.53 µs |     1.36 ms
+
+**With Crash Safety Fixes (new harness, Release build)**
+║ Sequential Writes                   |     5000 ops |      31.48 ms |     158822 ops/s |     6.30 µs |     2.97 ms
+║ Random Writes                       |     5000 ops |      31.72 ms |     157627 ops/s |     6.34 µs |     1.12 ms
+║ Sequential Reads                    |     5000 ops |     224.09 ms |      22312 ops/s |    44.82 µs |     1.04 ms
+║ Random Reads                        |     5000 ops |     231.25 ms |      21622 ops/s |    46.25 µs |     5.93 ms
+║ Updates (Overwrites)                |     2500 ops |      14.61 ms |     171141 ops/s |     5.84 µs |     0.16 ms
+║ Deletions                           |     2500 ops |       4.08 ms |     612277 ops/s |     1.63 µs |     0.59 ms
+║ Mixed Workload (50% R/W)            |     5000 ops |     126.33 ms |      39578 ops/s |    25.27 µs |     3.77 ms
+║ Full Compaction (4766 keys)         |        1 ops |       4.13 ms |        242 ops/s |  4134.75 µs |     3.56 ms
+║ Large Values (1024 bytes)           |      500 ops |      15.64 ms |      31975 ops/s |    31.27 µs |     0.25 ms
+║ Large Values (10240 bytes)          |      500 ops |     169.00 ms |       2959 ops/s |   337.99 µs |     1.75 ms
+║ Large Values (102400 bytes)         |       50 ops |     165.18 ms |        303 ops/s |  3303.62 µs |     1.71 ms
+║ WAL Recovery (2500 entries)         |     2500 ops |       1.39 ms |    1794435 ops/s |     0.56 µs |     0.01 ms
+
+**With Table Cache**
+║ Sequential Writes                   |     5000 ops |      32.44 ms |     154146 ops/s |     6.49 µs |     1.27 ms
+║ Random Writes                       |     5000 ops |      33.00 ms |     151504 ops/s |     6.60 µs |     1.39 ms
+║ Sequential Reads                    |     5000 ops |       3.06 ms |    1636086 ops/s |     0.61 µs |     0.07 ms
+║ Random Reads                        |     5000 ops |       3.30 ms |    1517291 ops/s |     0.66 µs |     0.03 ms
+║ Updates (Overwrites)                |     2500 ops |      14.46 ms |     172923 ops/s |     5.78 µs |     0.22 ms
+║ Deletions                           |     2500 ops |       3.80 ms |     658407 ops/s |     1.52 µs |     0.32 ms
+║ Mixed Workload (50% R/W)            |     5000 ops |      17.18 ms |     291068 ops/s |     3.44 µs |     0.34 ms
+║ Full Compaction (4766 keys)         |        1 ops |       5.53 ms |        181 ops/s |  5530.90 µs |     2.92 ms
+║ Large Values (1024 bytes)           |      500 ops |      15.86 ms |      31534 ops/s |    31.71 µs |     0.16 ms
+║ Large Values (10240 bytes)          |      500 ops |     177.65 ms |       2814 ops/s |   355.31 µs |     4.36 ms
+║ Large Values (102400 bytes)         |       50 ops |     174.77 ms |        286 ops/s |  3495.44 µs |    22.20 ms
+║ WAL Recovery (2500 entries)         |     2500 ops |       1.42 ms |    1763585 ops/s |     0.57 µs |     0.02 ms

@@ -105,15 +105,10 @@ std::string smalldb::get(const slice& key) const {
   // Lock while accessing the SSTable list and bloom filters
   std::lock_guard<std::mutex> lock(sstable_mutex_);
 
-  // Newest to oldest; the first table that has the key wins
+  // Newest to oldest; the first table that has the key wins. Each table
+  // checks its key range and bloom filter in memory before doing any I/O.
   for (const auto& table : sstables_) {
-    if (table.filter && !table.filter->contains(key)) {
-      continue; // Definitely not in this SSTable
-    }
-
-    // Either no bloom filter or bloom says "maybe present"
-    ss_table sstable(table.path);
-    if (auto result = sstable.get(key)) {
+    if (auto result = table->get(key)) {
       return *result == mem_table::tombstone ? "" : *result;
     }
   }
@@ -145,7 +140,7 @@ void smalldb::do_compact() {
       return;
     }
     for (const auto& table : sstables_) {
-      inputs.push_back(table.path);
+      inputs.push_back(table->path());
     }
   }
 
@@ -162,8 +157,15 @@ void smalldb::do_compact() {
     return;
   }
 
-  // Build the output's bloom filter outside the lock too
-  auto filter = build_filter(compacted_file);
+  // Open the output (index, bloom filter, fd) outside the lock too
+  std::shared_ptr<ss_table> compacted;
+  try {
+    compacted = ss_table::open(compacted_file);
+  } catch (const std::exception& e) {
+    smalldb_log::error("Compaction aborted: ", e.what());
+    remove_table_files(compacted_file);
+    return;
+  }
 
   {
     std::lock_guard<std::mutex> lock(sstable_mutex_);
@@ -172,7 +174,7 @@ void smalldb::do_compact() {
     // compaction_mutex_, so the inputs are still exactly the oldest tables.
     size_t keep = sstables_.size() - inputs.size();
     for (size_t i = 0; i < inputs.size(); ++i) {
-      if (sstables_[keep + i].path != inputs[i]) {
+      if (sstables_[keep + i]->path() != inputs[i]) {
         smalldb_log::error("Compaction aborted: table list changed unexpectedly");
         remove_table_files(compacted_file);
         return;
@@ -180,12 +182,12 @@ void smalldb::do_compact() {
     }
 
     // Replace only the inputs; keep any tables flushed during the merge
-    std::vector<sstable_handle> replaced;
+    std::vector<std::shared_ptr<ss_table>> replaced;
     for (size_t i = keep; i < sstables_.size(); ++i) {
       replaced.push_back(std::move(sstables_[i]));
     }
     sstables_.resize(keep);
-    sstables_.push_back({compacted_file, std::move(filter)});
+    sstables_.push_back(std::move(compacted));
 
     // Commit point: once the MANIFEST names the output, the inputs are dead.
     if (!write_manifest_locked()) {
@@ -232,10 +234,19 @@ void smalldb::flush_memtable() {
     throw std::runtime_error("failed to flush memtable to " + sstable_name);
   }
 
+  // Open it once for the table cache, reusing the filter built above
+  std::shared_ptr<ss_table> table;
+  try {
+    table = ss_table::open(sstable_name, std::move(filter));
+  } catch (...) {
+    remove_table_files(sstable_name);
+    throw;
+  }
+
   // Lock while updating SSTable list
   {
     std::lock_guard<std::mutex> lock(sstable_mutex_);
-    sstables_.insert(sstables_.begin(), {sstable_name, std::move(filter)});
+    sstables_.insert(sstables_.begin(), std::move(table));
     if (!write_manifest_locked()) {
       sstables_.erase(sstables_.begin());
       remove_table_files(sstable_name);
@@ -259,7 +270,7 @@ bool smalldb::write_manifest_locked() {
     std::ofstream out(tmp, std::ios::trunc);
     if (!out.is_open()) return false;
     for (const auto& table : sstables_) {
-      out << fs::path(table.path).filename().string() << '\n';
+      out << fs::path(table->path()).filename().string() << '\n';
     }
     out.close();
     if (!out) return false;
@@ -272,19 +283,6 @@ bool smalldb::write_manifest_locked() {
 
   // Persist the rename and any newly created table files' directory entries
   return file_util::sync_dir(data_dir_);
-}
-
-std::unique_ptr<bloom_filter> smalldb::build_filter(const std::string& path) {
-  // Stream keys only; don't load the whole table (values included) into RAM
-  std::vector<std::string> keys;
-  for (SSTableIterator it(path); it.valid(); it.next()) {
-    keys.push_back(it.key());
-  }
-  auto filter = std::make_unique<bloom_filter>(keys.empty() ? 1 : keys.size(), 0.01);
-  for (const auto& key : keys) {
-    filter->add(slice(key));
-  }
-  return filter;
 }
 
 void smalldb::load_sstables() {
@@ -350,14 +348,9 @@ void smalldb::load_sstables() {
     }
   }
 
-  // Rebuild bloom filters and check for index files
+  // Open each live table once (rebuilds a missing/invalid index itself)
   for (const auto& filepath : live) {
-    // Check if index file exists, rebuild if missing
-    if (!fs::exists(index_path_for(filepath))) {
-      smalldb_log::info("Building missing index for ", filepath);
-      ss_table::build_index(filepath);
-    }
-    sstables_.push_back({filepath, build_filter(filepath)});
+    sstables_.push_back(ss_table::open(filepath));
   }
 
   if (!fs::exists(manifest) && !write_manifest_locked()) {

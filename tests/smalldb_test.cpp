@@ -5,7 +5,10 @@
 
 #include "smalldb.h"
 
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -214,6 +217,113 @@ static void test_wal_checksum_detects_corruption() {
   fs::remove_all(crashed);
 }
 
+// ---------------------------------------------------------------------------
+// Table cache / ss_table lookup edge cases
+
+static std::string key_name(int i) {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "k%04d", i);
+  return buf;
+}
+
+// Write a table straight from a memtable and open it
+static std::shared_ptr<ss_table> make_table(const std::string& path,
+                                            const std::map<std::string, std::string>& data) {
+  mem_table mt(SIZE_MAX);
+  for (const auto& [k, v] : data) mt.set(slice(k), slice(v));
+  if (!ss_table::flush_memtable(mt, path)) throw std::runtime_error("flush failed");
+  return ss_table::open(path);
+}
+
+static std::optional<std::string> lookup(const ss_table& t, const std::string& k) {
+  return t.get(slice(k));
+}
+
+// Every present key (including the indexed ones at 0, 32, 64, ...), every gap
+// between keys, and keys before the first / after the last.
+static void test_table_lookup_boundaries() {
+  std::string dir = test_dir("table_bounds");
+  std::map<std::string, std::string> data;
+  for (int i = 0; i < 200; i += 2) data[key_name(i)] = "v" + std::to_string(i);  // 100 keys
+  auto t = make_table(dir + "/sstable_0.sst", data);
+
+  CHECK_EQ(t->index_size(), size_t(4));  // entries 0, 32, 64, 96
+  for (int i = 0; i < 200; i++) {
+    auto got = lookup(*t, key_name(i));
+    if (i % 2 == 0) {
+      CHECK(got.has_value() && *got == "v" + std::to_string(i));
+    } else {
+      CHECK(!got.has_value());
+    }
+    CHECK(!lookup(*t, key_name(i) + "x").has_value());  // just after each key
+  }
+  CHECK(!lookup(*t, "a").has_value());       // before smallest
+  CHECK(!lookup(*t, "k").has_value());       // prefix of every key
+  CHECK(!lookup(*t, "z").has_value());       // after largest
+  CHECK(!lookup(*t, "k9999").has_value());   // after largest, same prefix
+}
+
+static void test_table_tiny_and_empty() {
+  std::string dir = test_dir("table_tiny");
+  auto empty = make_table(dir + "/sstable_0.sst", {});
+  CHECK_EQ(empty->index_size(), size_t(0));
+  CHECK(!lookup(*empty, "anything").has_value());
+  CHECK(!lookup(*empty, "").has_value());
+
+  auto one = make_table(dir + "/sstable_1.sst", {{"only", "1"}});
+  CHECK(lookup(*one, "only") == std::optional<std::string>("1"));
+  CHECK(!lookup(*one, "onlx").has_value());
+  CHECK(!lookup(*one, "onlz").has_value());
+
+  // Empty value is distinguishable from missing at this layer
+  auto ev = make_table(dir + "/sstable_2.sst", {{"e", ""}});
+  CHECK(lookup(*ev, "e") == std::optional<std::string>(""));
+}
+
+static void test_table_large_values() {
+  std::string dir = test_dir("table_large");
+  std::map<std::string, std::string> data;
+  for (int i = 0; i < 40; i++) data[key_name(i)] = std::string(100 * 1024, char('a' + i % 26));
+  auto t = make_table(dir + "/sstable_0.sst", data);
+  for (int i = 0; i < 40; i++) {
+    auto got = lookup(*t, key_name(i));
+    CHECK(got.has_value() && got->size() == 100 * 1024 && (*got)[0] == char('a' + i % 26));
+  }
+}
+
+// A missing or corrupt .idx is rebuilt on open instead of trusted
+static void test_table_index_rebuild() {
+  std::string dir = test_dir("table_index");
+  std::map<std::string, std::string> data;
+  for (int i = 0; i < 100; i++) data[key_name(i)] = "v" + std::to_string(i);
+  std::string path = dir + "/sstable_0.sst";
+  make_table(path, data);
+
+  std::string idx = dir + "/sstable_0.idx";
+  {
+    std::ofstream out(idx, std::ios::binary | std::ios::trunc);
+    out << std::string(64, '\xFF');  // garbage: huge key_size / offsets
+  }
+  auto t = ss_table::open(path);
+  CHECK_EQ(t->index_size(), size_t(4));
+  CHECK(lookup(*t, key_name(77)) == std::optional<std::string>("v77"));
+
+  fs::remove(idx);
+  auto t2 = ss_table::open(path);
+  CHECK(fs::exists(idx));
+  CHECK(lookup(*t2, key_name(99)) == std::optional<std::string>("v99"));
+}
+
+// The table keeps its fd open: after compaction unlinks the file, a reader
+// still holding the table can finish (POSIX unlink semantics).
+static void test_table_readable_after_unlink() {
+  std::string dir = test_dir("table_unlink");
+  auto t = make_table(dir + "/sstable_0.sst", {{"a", "1"}, {"b", "2"}});
+  fs::remove(dir + "/sstable_0.sst");
+  fs::remove(dir + "/sstable_0.idx");
+  CHECK(lookup(*t, "b") == std::optional<std::string>("2"));
+}
+
 // Randomized test against std::map. With background compaction running
 // concurrently with flushes, this catches the old bugs where compaction
 // replaced the whole table list (losing tables flushed mid-merge) and where
@@ -286,6 +396,11 @@ int main() {
       {"WAL garbage tail", test_wal_garbage_tail},
       {"WAL torn last record", test_wal_torn_last_record},
       {"WAL checksum detects corruption", test_wal_checksum_detects_corruption},
+      {"table: lookup boundaries", test_table_lookup_boundaries},
+      {"table: tiny and empty tables", test_table_tiny_and_empty},
+      {"table: large values", test_table_large_values},
+      {"table: index rebuilt when missing/corrupt", test_table_index_rebuild},
+      {"table: readable after unlink", test_table_readable_after_unlink},
       {"model test (inline compaction)", [] { model_test(false); }},
       {"model test (background compaction)", [] { model_test(true); }},
   };

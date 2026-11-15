@@ -40,12 +40,6 @@ public:
   void wait_for_compaction();
 
 private:
-  // A live SSTable and its in-memory bloom filter
-  struct sstable_handle {
-    std::string path;
-    std::unique_ptr<bloom_filter> filter;
-  };
-
   void flush_memtable();
 
   void load_sstables();
@@ -64,9 +58,6 @@ private:
   // Caller must hold sstable_mutex_.
   bool write_manifest_locked();
 
-  // Build a bloom filter by streaming an SSTable's keys
-  static std::unique_ptr<bloom_filter> build_filter(const std::string& path);
-
   // Background compaction thread
   void background_compaction_thread();
 
@@ -83,8 +74,10 @@ private:
   std::unique_ptr<mem_table> memtable_;
   std::unique_ptr<wal> write_ahead_log_;
 
-  // Live SSTables, newest first. Guarded by sstable_mutex_.
-  std::vector<sstable_handle> sstables_;
+  // Table cache: live SSTables, newest first, each opened once and kept open
+  // (index, bloom filter, fd in memory). Guarded by sstable_mutex_; get()
+  // holds the lock for the whole lookup.
+  std::vector<std::shared_ptr<ss_table>> sstables_;
 
   // Incremented by both the client thread (flush) and the background thread
   // (compaction output), so it must be atomic to avoid duplicate file names.
