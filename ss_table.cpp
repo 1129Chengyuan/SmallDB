@@ -1,94 +1,170 @@
 #include "ss_table.h"
-#include "log.h"
-#include <fstream>
-#include <iostream>
-#include <algorithm>
+#include "coding.h"
+#include "crc32c.h"
 #include "file_util.h"
+#include "log.h"
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <filesystem>
 #include <stdexcept>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+namespace {
+constexpr size_t BLOCK_TRAILER = 4;   // crc32c
+constexpr size_t RECORD_HEADER = 8;   // key_len u32 + value_len u32
+constexpr double BLOOM_FP_RATE = 0.01;
+
+void put_handle(std::string& dst, const block_handle& h) {
+  coding::put_fixed64(dst, h.offset);
+  coding::put_fixed64(dst, h.size);
+}
+
+block_handle decode_handle(const char* p) {
+  return {coding::decode_fixed64(p), coding::decode_fixed64(p + 8)};
+}
+
+// Parse the record at block[pos]. Returns false if it runs past the end of
+// the block (corruption — checksums make this unlikely but we never trust it).
+bool parse_record(const std::string& block, size_t pos,
+                  const char*& key, uint32_t& key_len,
+                  const char*& value, uint32_t& value_len) {
+  if (block.size() - pos < RECORD_HEADER) return false;
+  key_len = coding::decode_fixed32(block.data() + pos);
+  value_len = coding::decode_fixed32(block.data() + pos + 4);
+  size_t remaining = block.size() - pos - RECORD_HEADER;
+  if (key_len > remaining || value_len > remaining - key_len) return false;
+  key = block.data() + pos + RECORD_HEADER;
+  value = key + key_len;
+  return true;
+}
+
+std::runtime_error corruption(const std::string& file, const std::string& what) {
+  return std::runtime_error("corrupt SSTable " + file + ": " + what);
+}
+} // namespace
+
 // ============================================================================
-// SSTableIterator Implementation
+// sstable_builder
 // ============================================================================
 
-SSTableIterator::SSTableIterator(const std::string& filename)
-    : filename_(filename), valid_(false) {
-  file_.open(filename_, std::ios::binary);
-  if (!file_.is_open()) {
-    smalldb_log::error("Failed to open SSTable for iteration: ", filename_);
-    return;
-  }
-  // Read first entry
-  valid_ = read_next();
-}
-
-SSTableIterator::~SSTableIterator() {
-  if (file_.is_open()) {
-    file_.close();
+sstable_builder::sstable_builder(const std::string& file_name, size_t block_size)
+    : file_name_(file_name), block_size_(block_size) {
+  out_.open(file_name_, std::ios::binary | std::ios::trunc);
+  if (!out_.is_open()) {
+    throw std::runtime_error("cannot create SSTable " + file_name_);
   }
 }
 
-bool SSTableIterator::next() {
-  if (!valid_) {
+sstable_builder::~sstable_builder() {
+  if (!finished_) {
+    // Abandoned (error or exception): never leave a half-written table behind
+    out_.close();
+    std::error_code ec;
+    std::filesystem::remove(file_name_, ec);
+  }
+}
+
+void sstable_builder::add(const slice& key, const slice& value) {
+  if (num_entries_ > 0 && key.compareTo(slice(last_key_)) <= 0) {
+    throw std::logic_error("sstable_builder: keys must be strictly increasing");
+  }
+  if (num_entries_ == 0) {
+    smallest_key_ = key.toString();
+  }
+
+  coding::put_fixed32(block_, static_cast<uint32_t>(key.size()));
+  coding::put_fixed32(block_, static_cast<uint32_t>(value.size()));
+  block_.append(key.data(), key.size());
+  block_.append(value.data(), value.size());
+
+  last_key_.assign(key.data(), key.size());
+  key_hashes_.push_back(bloom_filter::hash(key));
+  num_entries_++;
+
+  // Close the block once it's big enough. A single large record makes one
+  // oversized block, which is fine: reading it is still one pread.
+  if (block_.size() >= block_size_) {
+    flush_data_block();
+  }
+}
+
+block_handle sstable_builder::write_block(const std::string& contents) {
+  block_handle handle{offset_, contents.size()};
+  std::string trailer;
+  coding::put_fixed32(trailer, crc32c::value(contents.data(), contents.size()));
+  out_.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  out_.write(trailer.data(), static_cast<std::streamsize>(trailer.size()));
+  if (!out_) {
+    throw std::runtime_error("write failed: " + file_name_);
+  }
+  offset_ += contents.size() + BLOCK_TRAILER;
+  return handle;
+}
+
+void sstable_builder::flush_data_block() {
+  if (block_.empty()) return;
+  block_handle handle = write_block(block_);
+  index_.push_back({last_key_, handle});
+  block_.clear();
+}
+
+bool sstable_builder::finish() {
+  try {
+    flush_data_block();
+
+    // Filter block: bloom filter over every key
+    bloom_filter filter(key_hashes_.size(), BLOOM_FP_RATE);
+    for (uint64_t h : key_hashes_) filter.add_hash(h);
+    block_handle filter_handle = write_block(filter.serialize());
+
+    // Meta block: entry count and key range
+    std::string meta;
+    coding::put_fixed64(meta, num_entries_);
+    coding::put_length_prefixed(meta, smallest_key_.data(), smallest_key_.size());
+    coding::put_length_prefixed(meta, last_key_.data(), last_key_.size());
+    block_handle meta_handle = write_block(meta);
+
+    // Index block: last key + location of every data block
+    std::string index;
+    for (const auto& entry : index_) {
+      coding::put_length_prefixed(index, entry.last_key.data(), entry.last_key.size());
+      put_handle(index, entry.handle);
+    }
+    block_handle index_handle = write_block(index);
+
+    // Footer: written last, fixed size, so readers can always find it
+    std::string footer;
+    put_handle(footer, filter_handle);
+    put_handle(footer, meta_handle);
+    put_handle(footer, index_handle);
+    coding::put_fixed32(footer, ss_table::FORMAT_VERSION);
+    coding::put_fixed32(footer, crc32c::value(footer.data(), footer.size()));
+    coding::put_fixed64(footer, ss_table::MAGIC);
+    out_.write(footer.data(), static_cast<std::streamsize>(footer.size()));
+
+    out_.close();
+    if (!out_) {
+      smalldb_log::error("Failed to write SSTable ", file_name_);
+      return false;
+    }
+    // Durable before the caller commits it to the MANIFEST / truncates the WAL
+    if (!file_util::sync_file(file_name_)) {
+      smalldb_log::error("fsync failed for SSTable ", file_name_);
+      return false;
+    }
+  } catch (const std::exception& e) {
+    smalldb_log::error("Failed to finish SSTable ", file_name_, ": ", e.what());
     return false;
   }
-  valid_ = read_next();
-  return valid_;
-}
-
-bool SSTableIterator::valid() const {
-  return valid_;
-}
-
-std::string SSTableIterator::key() const {
-  return current_key_;
-}
-
-std::string SSTableIterator::value() const {
-  return current_value_;
-}
-
-void SSTableIterator::seek_to_first() {
-  file_.clear();
-  file_.seekg(0, std::ios::beg);
-  valid_ = read_next();
-}
-
-bool SSTableIterator::read_next() {
-  if (!file_.is_open()) {
-    return false;
-  }
-
-  size_t key_size, value_size;
-  
-  if (!file_.read(reinterpret_cast<char*>(&key_size), sizeof(size_t))) {
-    return false; // EOF or error
-  }
-  
-  if (!file_.read(reinterpret_cast<char*>(&value_size), sizeof(size_t))) {
-    return false;
-  }
-
-  current_key_.resize(key_size);
-  current_value_.resize(value_size);
-
-  if (!file_.read(&current_key_[0], key_size)) {
-    return false;
-  }
-
-  if (!file_.read(&current_value_[0], value_size)) {
-    return false;
-  }
-
+  finished_ = true;
   return true;
 }
 
 // ============================================================================
-// ss_table Implementation
+// ss_table
 // ============================================================================
 
 ss_table::ss_table(const std::string& file_name, int fd)
@@ -100,8 +176,38 @@ ss_table::~ss_table() {
   }
 }
 
-std::shared_ptr<ss_table> ss_table::open(const std::string& file_name,
-                                         std::unique_ptr<bloom_filter> filter) {
+void ss_table::read_block(const block_handle& handle, std::string& contents) const {
+  // Every block must lie entirely before the footer
+  uint64_t limit = file_size_ - FOOTER_SIZE;
+  if (handle.offset > limit || handle.size > limit - handle.offset ||
+      BLOCK_TRAILER > limit - handle.offset - handle.size) {
+    throw corruption(file_name_, "block handle out of range");
+  }
+
+  size_t n = static_cast<size_t>(handle.size) + BLOCK_TRAILER;
+  contents.resize(n);
+  size_t done = 0;
+  while (done < n) {
+    ssize_t got = ::pread(fd_, contents.data() + done, n - done,
+                          static_cast<off_t>(handle.offset + done));
+    if (got < 0) {
+      if (errno == EINTR) continue;
+      throw std::runtime_error("read failed in " + file_name_ + ": " + std::strerror(errno));
+    }
+    if (got == 0) {
+      throw corruption(file_name_, "unexpected end of file");
+    }
+    done += static_cast<size_t>(got);
+  }
+
+  uint32_t stored = coding::decode_fixed32(contents.data() + handle.size);
+  if (crc32c::value(contents.data(), handle.size) != stored) {
+    throw corruption(file_name_, "block checksum mismatch at offset " + std::to_string(handle.offset));
+  }
+  contents.resize(handle.size);
+}
+
+std::shared_ptr<ss_table> ss_table::open(const std::string& file_name) {
   int fd = ::open(file_name.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) {
     throw std::runtime_error("cannot open SSTable " + file_name + ": " + std::strerror(errno));
@@ -113,329 +219,179 @@ std::shared_ptr<ss_table> ss_table::open(const std::string& file_name,
   if (::fstat(fd, &st) != 0) {
     throw std::runtime_error("cannot stat SSTable " + file_name + ": " + std::strerror(errno));
   }
-  table->file_size_ = static_cast<size_t>(st.st_size);
+  table->file_size_ = static_cast<uint64_t>(st.st_size);
+  if (table->file_size_ < FOOTER_SIZE) {
+    throw corruption(file_name, "file too small to contain a footer");
+  }
 
-  if (!table->load_index()) {
-    smalldb_log::info("Rebuilding missing or invalid index for ", file_name);
-    if (!build_index(file_name) || !table->load_index()) {
-      throw std::runtime_error("cannot build a valid index for " + file_name);
+  // 1. Footer: last 64 bytes
+  std::string footer(FOOTER_SIZE, '\0');
+  if (::pread(fd, footer.data(), FOOTER_SIZE,
+              static_cast<off_t>(table->file_size_ - FOOTER_SIZE)) != static_cast<ssize_t>(FOOTER_SIZE)) {
+    throw std::runtime_error("cannot read footer of " + file_name);
+  }
+  if (coding::decode_fixed64(footer.data() + 56) != MAGIC) {
+    throw corruption(file_name, "bad magic number (truncated file, or an old-format SSTable)");
+  }
+  if (crc32c::value(footer.data(), 52) != coding::decode_fixed32(footer.data() + 52)) {
+    throw corruption(file_name, "footer checksum mismatch");
+  }
+  uint32_t version = coding::decode_fixed32(footer.data() + 48);
+  if (version != FORMAT_VERSION) {
+    throw corruption(file_name, "unsupported format version " + std::to_string(version));
+  }
+  block_handle filter_handle = decode_handle(footer.data());
+  block_handle meta_handle = decode_handle(footer.data() + 16);
+  block_handle index_handle = decode_handle(footer.data() + 32);
+
+  // 2. Meta block: entry count and key range
+  std::string meta;
+  table->read_block(meta_handle, meta);
+  if (meta.size() < 8) throw corruption(file_name, "meta block too small");
+  table->num_entries_ = coding::decode_fixed64(meta.data());
+  const char* p = meta.data() + 8;
+  const char* limit = meta.data() + meta.size();
+  if (!coding::get_length_prefixed(p, limit, table->smallest_) ||
+      !coding::get_length_prefixed(p, limit, table->largest_)) {
+    throw corruption(file_name, "bad meta block");
+  }
+
+  // 3. Index block
+  std::string index;
+  table->read_block(index_handle, index);
+  p = index.data();
+  limit = index.data() + index.size();
+  uint64_t expected_offset = 0;  // data blocks are contiguous from offset 0
+  while (p < limit) {
+    IndexEntry entry;
+    if (!coding::get_length_prefixed(p, limit, entry.last_key) || limit - p < 16) {
+      throw corruption(file_name, "bad index block");
     }
+    entry.handle = decode_handle(p);
+    p += 16;
+    if (entry.handle.offset != expected_offset ||
+        (!table->index_.empty() &&
+         slice(table->index_.back().last_key).compareTo(slice(entry.last_key)) >= 0)) {
+      throw corruption(file_name, "index entries out of order");
+    }
+    expected_offset = entry.handle.offset + entry.handle.size + BLOCK_TRAILER;
+    table->index_.push_back(std::move(entry));
+  }
+  if ((table->num_entries_ == 0) != table->index_.empty() ||
+      (!table->index_.empty() && table->index_.back().last_key != table->largest_)) {
+    throw corruption(file_name, "index does not match meta block");
   }
 
-  if (!table->sparse_index_.empty()) {
-    // The first record is always indexed, so this is the exact smallest key
-    table->smallest_ = table->sparse_index_.front().key;
-    table->largest_ = table->find_largest_key();
+  // 4. Filter block
+  std::string filter;
+  table->read_block(filter_handle, filter);
+  table->filter_ = bloom_filter::deserialize(filter.data(), filter.size());
+  if (!table->filter_) {
+    throw corruption(file_name, "bad filter block");
   }
 
-  table->filter_ = filter ? std::move(filter) : table->build_filter();
   return table;
-}
-
-std::string ss_table::get_index_file_path(const std::string& sstable_file) {
-  // Convert "sstable_0.sst" to "sstable_0.idx"
-  size_t pos = sstable_file.find_last_of('.');
-  if (pos != std::string::npos) {
-    return sstable_file.substr(0, pos) + ".idx";
-  }
-  return sstable_file + ".idx";
-}
-
-bool ss_table::load_index() {
-  sparse_index_.clear();
-
-  std::string index_file = get_index_file_path(file_name_);
-  std::ifstream input(index_file, std::ios::binary | std::ios::ate);
-  if (!input.is_open()) {
-    return false;
-  }
-
-  // Read the whole index in one go, then parse with bounds checks
-  std::string data(static_cast<size_t>(input.tellg()), '\0');
-  input.seekg(0);
-  if (!input.read(data.data(), data.size())) {
-    return false;
-  }
-
-  // Index entries: [key_size][offset][key_data]
-  constexpr size_t HEADER = 2 * sizeof(size_t);
-  std::vector<IndexEntry> entries;
-  size_t pos = 0;
-  while (pos < data.size()) {
-    if (data.size() - pos < HEADER) return false;
-    size_t key_size, offset;
-    std::memcpy(&key_size, data.data() + pos, sizeof(size_t));
-    std::memcpy(&offset, data.data() + pos + sizeof(size_t), sizeof(size_t));
-    pos += HEADER;
-    if (key_size > data.size() - pos) return false;
-    std::string key(data.data() + pos, key_size);
-    pos += key_size;
-
-    // Offsets must point inside the data file and keys must be increasing,
-    // otherwise lookups would read garbage or binary-search the wrong chunk
-    if (offset >= file_size_) return false;
-    if (!entries.empty() &&
-        (offset <= entries.back().offset || slice(entries.back().key).compareTo(slice(key)) >= 0)) {
-      return false;
-    }
-    entries.push_back({std::move(key), offset});
-  }
-
-  // An empty table has an empty index; a non-empty one must index record 0
-  if (file_size_ == 0) {
-    if (!entries.empty()) return false;
-  } else if (entries.empty() || entries.front().offset != 0) {
-    return false;
-  }
-
-  sparse_index_ = std::move(entries);
-  return true;
-}
-
-bool ss_table::read_at(size_t offset, size_t n, std::string& buf) const {
-  buf.resize(n);
-  size_t done = 0;
-  while (done < n) {
-    ssize_t got = ::pread(fd_, buf.data() + done, n - done, static_cast<off_t>(offset + done));
-    if (got < 0) {
-      if (errno == EINTR) continue;
-      return false;
-    }
-    if (got == 0) return false;  // unexpected EOF
-    done += static_cast<size_t>(got);
-  }
-  return true;
-}
-
-namespace {
-constexpr size_t RECORD_HEADER = 2 * sizeof(size_t);
-
-// Parse the record at buf[pos]: [key_size][value_size][key][value].
-// Returns false if it runs past the end of the buffer (corruption).
-bool parse_record(const std::string& buf, size_t pos,
-                  const char*& key, size_t& key_size,
-                  const char*& value, size_t& value_size) {
-  if (buf.size() - pos < RECORD_HEADER) return false;
-  std::memcpy(&key_size, buf.data() + pos, sizeof(size_t));
-  std::memcpy(&value_size, buf.data() + pos + sizeof(size_t), sizeof(size_t));
-  size_t remaining = buf.size() - pos - RECORD_HEADER;
-  if (key_size > remaining || value_size > remaining - key_size) return false;
-  key = buf.data() + pos + RECORD_HEADER;
-  value = key + key_size;
-  return true;
-}
-} // namespace
-
-std::string ss_table::find_largest_key() const {
-  size_t start = sparse_index_.back().offset;
-  std::string buf;
-  if (!read_at(start, file_size_ - start, buf)) {
-    throw std::runtime_error("cannot read last chunk of " + file_name_);
-  }
-  std::string last;
-  size_t pos = 0;
-  while (pos < buf.size()) {
-    const char* key; const char* value;
-    size_t key_size, value_size;
-    if (!parse_record(buf, pos, key, key_size, value, value_size)) {
-      throw std::runtime_error("corrupt record in " + file_name_);
-    }
-    last.assign(key, key_size);
-    pos += RECORD_HEADER + key_size + value_size;
-  }
-  return last;
-}
-
-std::unique_ptr<bloom_filter> ss_table::build_filter() const {
-  // Stream keys only; don't load the whole table (values included) into RAM
-  std::vector<std::string> keys;
-  for (SSTableIterator it(file_name_); it.valid(); it.next()) {
-    keys.push_back(it.key());
-  }
-  auto filter = std::make_unique<bloom_filter>(keys.empty() ? 1 : keys.size(), 0.01);
-  for (const auto& key : keys) {
-    filter->add(slice(key));
-  }
-  return filter;
-}
-
-bool ss_table::build_index(const std::string& sstable_file, size_t index_interval) {
-  std::string index_file = get_index_file_path(sstable_file);
-  std::ifstream input(sstable_file, std::ios::binary);
-  std::ofstream output(index_file, std::ios::binary | std::ios::trunc);
-  
-  if (!input.is_open() || !output.is_open()) {
-    smalldb_log::error("Failed to build index for ", sstable_file);
-    return false;
-  }
-  
-  size_t entry_count = 0;
-  size_t current_offset = 0;
-  size_t key_size, value_size;
-  
-  while (input.read((char*)&key_size, sizeof(size_t))) {
-    input.read((char*)&value_size, sizeof(size_t));
-    
-    // Every Nth entry goes into the index
-    if (entry_count % index_interval == 0) {
-      std::string key(key_size, '\0');
-      input.read(&key[0], key_size);
-      
-      // Write to index file: [key_size][offset][key_data]
-      output.write(reinterpret_cast<const char*>(&key_size), sizeof(size_t));
-      output.write(reinterpret_cast<const char*>(&current_offset), sizeof(size_t));
-      output.write(key.data(), key_size);
-      
-      // Skip the value
-      input.seekg(value_size, std::ios::cur);
-    } else {
-      // Skip this entire entry
-      input.seekg(key_size + value_size, std::ios::cur);
-    }
-    
-    // Update offset for next entry
-    current_offset += sizeof(size_t) * 2 + key_size + value_size;
-    entry_count++;
-  }
-  
-  input.close();
-  output.close();
-  if (!output) {
-    smalldb_log::error("Failed to write index ", index_file);
-    return false;
-  }
-  return file_util::sync_file(index_file);
-}
-
-bool ss_table::flush_memtable(const mem_table &mem_table,
-                              const std::string &file_name) {
-  std::ofstream output_stream(file_name, std::ios::binary | std::ios::trunc);
-  if (!output_stream.is_open()) {
-    smalldb_log::error(file_name, ": failed to create ss_table from mem_table");
-    return false;
-  }
-  const auto &data = mem_table.getData();
-  for (const auto &pair : data) {
-    size_t key_size = pair.first.size();
-    size_t value_size = pair.second.size();
-
-    output_stream.write(reinterpret_cast<const char *>(&key_size), sizeof(size_t));
-    output_stream.write(reinterpret_cast<const char *>(&value_size), sizeof(size_t));
-    output_stream.write(pair.first.data(), key_size);
-    output_stream.write(pair.second.data(), value_size);
-  }
-  output_stream.close();
-  if (!output_stream) {
-    smalldb_log::error(file_name, ": failed to write ss_table");
-    return false;
-  }
-
-  // Durable before the caller truncates the WAL that backs this data
-  if (!file_util::sync_file(file_name)) {
-    smalldb_log::error(file_name, ": fsync failed");
-    return false;
-  }
-
-  // Build index after writing SSTable
-  return build_index(file_name);
 }
 
 std::optional<std::string> ss_table::get(const slice& key) const {
   // 1. Key range and bloom filter: both in memory, no I/O
-  if (sparse_index_.empty()) {
+  if (index_.empty()) {
     return std::nullopt;  // empty table
   }
   if (key.compareTo(slice(smallest_)) < 0 || key.compareTo(slice(largest_)) > 0) {
     return std::nullopt;
   }
-  if (filter_ && !filter_->contains(key)) {
+  if (!filter_->contains(key)) {
     return std::nullopt;  // definitely not here
   }
 
-  // 2. Binary search: last index entry with entry.key <= key. Never begin()
-  //    because key >= smallest_ == sparse_index_[0].key.
-  auto it = std::upper_bound(
-      sparse_index_.begin(), sparse_index_.end(), key,
-      [](const slice& k, const IndexEntry& entry) {
-        return slice(entry.key).compareTo(k) > 0;
+  // 2. Binary search: first block whose last key >= key. Always exists,
+  //    because key <= largest_ == index_.back().last_key.
+  auto it = std::lower_bound(
+      index_.begin(), index_.end(), key,
+      [](const IndexEntry& entry, const slice& k) {
+        return slice(entry.last_key).compareTo(k) < 0;
       });
-  --it;
 
-  // 3. The key, if present, lies between this index entry and the next one
-  size_t start = it->offset;
-  size_t end = (it + 1 != sparse_index_.end()) ? (it + 1)->offset : file_size_;
+  // 3. One pread for that block, checksum verified
+  std::string block;
+  read_block(it->handle, block);
 
-  // 4. One pread for the whole chunk
-  std::string buf;
-  if (!read_at(start, end - start, buf)) {
-    throw std::runtime_error("read failed in " + file_name_ + ": " + std::strerror(errno));
-  }
-
-  // 5. Scan the chunk in memory, comparing keys without allocating
+  // 4. Scan the block in memory, comparing keys without allocating
   size_t pos = 0;
-  while (pos < buf.size()) {
+  while (pos < block.size()) {
     const char* rec_key; const char* rec_value;
-    size_t key_size, value_size;
-    if (!parse_record(buf, pos, rec_key, key_size, rec_value, value_size)) {
-      throw std::runtime_error("corrupt record in " + file_name_);
+    uint32_t key_len, value_len;
+    if (!parse_record(block, pos, rec_key, key_len, rec_value, value_len)) {
+      throw corruption(file_name_, "bad record in data block");
     }
-    int cmp = slice(rec_key, key_size).compareTo(key);
+    int cmp = slice(rec_key, key_len).compareTo(key);
     if (cmp == 0) {
-      return std::string(rec_value, value_size);
+      return std::string(rec_value, value_len);
     }
     if (cmp > 0) {
       return std::nullopt;  // sorted: we've passed where it would be
     }
-    pos += RECORD_HEADER + key_size + value_size;
+    pos += RECORD_HEADER + key_len + value_len;
   }
   return std::nullopt;
 }
 
-std::map<std::string, std::string> ss_table::read_all(const std::string& file_name) {
-  std::map<std::string, std::string> data;
-  std::ifstream input(file_name, std::ios::binary);
-
-  if (!input.is_open()) {
-    return data;
+bool ss_table::flush_memtable(const mem_table& mem_table, const std::string& file_name) {
+  try {
+    sstable_builder builder(file_name);
+    for (const auto& [key, value] : mem_table.getData()) {
+      builder.add(slice(key), slice(value));
+    }
+    return builder.finish();
+  } catch (const std::exception& e) {
+    smalldb_log::error("Failed to flush memtable to ", file_name, ": ", e.what());
+    return false;
   }
-
-  size_t key_size, value_size;
-  while (input.read((char*)&key_size, sizeof(size_t))) {
-    input.read((char*)&value_size, sizeof(size_t));
-
-    std::string key(key_size, '\0');
-    std::string value(value_size, '\0');
-
-    input.read(&key[0], key_size);
-    input.read(&value[0], value_size);
-
-    data[key] = value;
-  }
-
-  input.close();
-  return data;
 }
 
-void ss_table::write_all(const std::string& file_name, const std::map<std::string, std::string>& data) {
-  std::ofstream output(file_name, std::ios::binary);
+// ============================================================================
+// SSTableIterator
+// ============================================================================
 
-  if (!output.is_open()) {
-    smalldb_log::error("Failed to create SSTable: ", file_name);
-    return;
+SSTableIterator::SSTableIterator(const std::string& filename)
+    : SSTableIterator(std::shared_ptr<const ss_table>(ss_table::open(filename))) {}
+
+SSTableIterator::SSTableIterator(std::shared_ptr<const ss_table> table)
+    : table_(std::move(table)) {
+  seek_to_first();
+}
+
+void SSTableIterator::seek_to_first() {
+  block_index_ = 0;
+  block_.clear();
+  pos_ = 0;
+  valid_ = load_current();
+}
+
+bool SSTableIterator::next() {
+  if (!valid_) return false;
+  pos_ += RECORD_HEADER + key_.size() + value_.size();
+  valid_ = load_current();
+  return valid_;
+}
+
+bool SSTableIterator::load_current() {
+  // Move to the next block when the current one is exhausted
+  while (pos_ >= block_.size()) {
+    if (block_index_ >= table_->index_.size()) {
+      return false;  // end of table
+    }
+    table_->read_block(table_->index_[block_index_].handle, block_);
+    block_index_++;
+    pos_ = 0;
   }
-
-  for (const auto& [key, value] : data) {
-    size_t key_size = key.size();
-    size_t value_size = value.size();
-
-    output.write(reinterpret_cast<const char*>(&key_size), sizeof(size_t));
-    output.write(reinterpret_cast<const char*>(&value_size), sizeof(size_t));
-    output.write(key.data(), key_size);
-    output.write(value.data(), value_size);
+  const char* key; const char* value;
+  uint32_t key_len, value_len;
+  if (!parse_record(block_, pos_, key, key_len, value, value_len)) {
+    throw corruption(table_->path(), "bad record in data block");
   }
-
-  output.close();
-  
-  // Build index after writing SSTable
-  build_index(file_name);
+  key_.assign(key, key_len);
+  value_.assign(value, value_len);
+  return true;
 }

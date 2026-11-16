@@ -3,11 +3,9 @@
 #include "mem_table.h"
 #include "ss_table.h"
 #include <queue>
-#include <fstream>
 #include <memory>
 #include <iostream>
 #include <filesystem>
-#include "file_util.h"
 
 // Helper to track an entry and which SSTable it belongs to
 struct MergeEntry {
@@ -83,101 +81,64 @@ std::map<std::string, std::string> compaction::merge(const std::vector<std::map<
 // New streaming merge - only keeps iterators in memory, not all data!
 std::optional<size_t> compaction::streaming_merge(const std::vector<std::string>& sstable_files, 
                                     const std::string& output_file) {
-    auto fail = [&](const std::string& why) -> std::optional<size_t> {
-        smalldb_log::error("Compaction failed (", why, "): ", output_file);
+    try {
+        // Writes the block-based output; deletes the partial file if we
+        // throw or return before finish() succeeds
+        sstable_builder builder(output_file);
+
+        // Create iterators for each input SSTable (newest first). Opening or
+        // reading a corrupt input throws, which aborts the whole compaction:
+        // treating it as empty would delete its data with the inputs.
+        std::vector<std::unique_ptr<SSTableIterator>> iterators;
+        for (const auto& file : sstable_files) {
+            auto it = std::make_unique<SSTableIterator>(file);
+            if (it->valid()) {
+                iterators.push_back(std::move(it));
+            }
+        }
+
+        // Min heap to track which iterator has the smallest current key
+        std::priority_queue<MergeEntry, std::vector<MergeEntry>, std::greater<MergeEntry>> min_heap;
+
+        // Initialize heap with first entry from each iterator
+        for (size_t i = 0; i < iterators.size(); ++i) {
+            min_heap.push({iterators[i]->key(), iterators[i]->value(), i});
+        }
+
+        std::string last_key;
+        bool have_last = false;
+
+        // K-way merge: process entries in sorted order
+        while (!min_heap.empty()) {
+            MergeEntry current = min_heap.top();
+            min_heap.pop();
+
+            // Only write if this is a new key (skip duplicates, take most recent)
+            if (!have_last || current.key != last_key) {
+                // Skip tombstones
+                if (current.value != mem_table::tombstone) {
+                    builder.add(slice(current.key), slice(current.value));
+                }
+                last_key = current.key;
+                have_last = true;
+            }
+
+            // Advance the iterator that just gave us this entry
+            size_t iter_idx = current.table_index;
+            if (iterators[iter_idx]->next()) {
+                min_heap.push({iterators[iter_idx]->key(), iterators[iter_idx]->value(), iter_idx});
+            }
+        }
+
+        if (!builder.finish()) {
+            smalldb_log::error("Compaction failed (write error): ", output_file);
+            return std::nullopt;
+        }
+        return builder.num_entries();
+    } catch (const std::exception& e) {
+        smalldb_log::error("Compaction failed (", e.what(), "): ", output_file);
         std::error_code ec;
         std::filesystem::remove(output_file, ec);
-        std::filesystem::remove(output_file.substr(0, output_file.find_last_of('.')) + ".idx", ec);
         return std::nullopt;
-    };
-
-    // Open output file for writing
-    std::ofstream output(output_file, std::ios::binary | std::ios::trunc);
-    if (!output.is_open()) {
-        return fail("cannot open output");
     }
-
-    // Create iterators for each input SSTable
-    std::vector<std::unique_ptr<SSTableIterator>> iterators;
-    for (const auto& file : sstable_files) {
-        auto it = std::make_unique<SSTableIterator>(file);
-        if (it->valid()) {
-            iterators.push_back(std::move(it));
-        }
-    }
-
-    if (iterators.empty()) {
-        output.close();
-        if (!output || !file_util::sync_file(output_file) || !ss_table::build_index(output_file)) {
-            return fail("write error");
-        }
-        return 0;
-    }
-
-    // Min heap to track which iterator has the smallest current key
-    std::priority_queue<MergeEntry, std::vector<MergeEntry>, std::greater<MergeEntry>> min_heap;
-
-    // Initialize heap with first entry from each iterator
-    for (size_t i = 0; i < iterators.size(); ++i) {
-        if (iterators[i]->valid()) {
-            min_heap.push({
-                iterators[i]->key(),
-                iterators[i]->value(),
-                i
-            });
-        }
-    }
-
-    std::string last_key = "";
-    size_t entries_written = 0;
-
-    // K-way merge: process entries in sorted order
-    while (!min_heap.empty()) {
-        MergeEntry current = min_heap.top();
-        min_heap.pop();
-
-        // Only write if this is a new key (skip duplicates, take most recent)
-        if (current.key != last_key) {
-            // Skip tombstones
-            if (current.value != mem_table::tombstone) {
-                // Write entry to output file
-                size_t key_size = current.key.size();
-                size_t value_size = current.value.size();
-
-                output.write(reinterpret_cast<const char*>(&key_size), sizeof(size_t));
-                output.write(reinterpret_cast<const char*>(&value_size), sizeof(size_t));
-                output.write(current.key.data(), key_size);
-                output.write(current.value.data(), value_size);
-
-                entries_written++;
-            }
-            last_key = current.key;
-        }
-
-        // Advance the iterator that just gave us this entry
-        size_t iter_idx = current.table_index;
-        if (iterators[iter_idx]->next()) {
-            // Still has more entries, push next one
-            min_heap.push({
-                iterators[iter_idx]->key(),
-                iterators[iter_idx]->value(),
-                iter_idx
-            });
-        }
-    }
-
-    output.close();
-    if (!output) {
-        return fail("write error");
-    }
-    if (!file_util::sync_file(output_file)) {
-        return fail("fsync error");
-    }
-
-    // Build index for the output file
-    if (!ss_table::build_index(output_file)) {
-        return fail("index error");
-    }
-
-    return entries_written;
 }

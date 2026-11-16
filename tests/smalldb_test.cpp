@@ -112,7 +112,6 @@ static void test_crash_mid_compaction_does_not_resurrect() {
   fs::remove_all(saved);
   fs::create_directories(saved);
   fs::copy(dir + "/sstable_0.sst", saved + "/sstable_0.sst");
-  fs::copy(dir + "/sstable_0.idx", saved + "/sstable_0.idx");
 
   {
     test_db db(dir, 100, false);
@@ -124,7 +123,6 @@ static void test_crash_mid_compaction_does_not_resurrect() {
 
   // Simulate the crash window: an old input survived deletion...
   fs::copy(saved + "/sstable_0.sst", dir + "/sstable_0.sst");
-  fs::copy(saved + "/sstable_0.idx", dir + "/sstable_0.idx");
   // ...and an uncommitted output (never recorded in MANIFEST) exists too
   fs::copy(saved + "/sstable_0.sst", dir + "/sstable_50.sst");
 
@@ -239,19 +237,24 @@ static std::optional<std::string> lookup(const ss_table& t, const std::string& k
   return t.get(slice(k));
 }
 
-// Every present key (including the indexed ones at 0, 32, 64, ...), every gap
-// between keys, and keys before the first / after the last.
+static std::string value_for(int i) {
+  return "v" + std::to_string(i) + std::string(100, 'x');
+}
+
+// Every present key (including the first and last key of every block), every
+// gap between keys, and keys before the first / after the last.
 static void test_table_lookup_boundaries() {
   std::string dir = test_dir("table_bounds");
   std::map<std::string, std::string> data;
-  for (int i = 0; i < 200; i += 2) data[key_name(i)] = "v" + std::to_string(i);  // 100 keys
+  for (int i = 0; i < 200; i += 2) data[key_name(i)] = value_for(i);  // 100 keys, ~12 KB
   auto t = make_table(dir + "/sstable_0.sst", data);
 
-  CHECK_EQ(t->index_size(), size_t(4));  // entries 0, 32, 64, 96
+  CHECK(t->num_blocks() >= 3);  // spans several 4 KB blocks
+  CHECK_EQ(t->num_entries(), uint64_t(100));
   for (int i = 0; i < 200; i++) {
     auto got = lookup(*t, key_name(i));
     if (i % 2 == 0) {
-      CHECK(got.has_value() && *got == "v" + std::to_string(i));
+      CHECK(got.has_value() && *got == value_for(i));
     } else {
       CHECK(!got.has_value());
     }
@@ -266,7 +269,7 @@ static void test_table_lookup_boundaries() {
 static void test_table_tiny_and_empty() {
   std::string dir = test_dir("table_tiny");
   auto empty = make_table(dir + "/sstable_0.sst", {});
-  CHECK_EQ(empty->index_size(), size_t(0));
+  CHECK_EQ(empty->num_blocks(), size_t(0));
   CHECK(!lookup(*empty, "anything").has_value());
   CHECK(!lookup(*empty, "").has_value());
 
@@ -285,33 +288,113 @@ static void test_table_large_values() {
   std::map<std::string, std::string> data;
   for (int i = 0; i < 40; i++) data[key_name(i)] = std::string(100 * 1024, char('a' + i % 26));
   auto t = make_table(dir + "/sstable_0.sst", data);
+  CHECK_EQ(t->num_blocks(), size_t(40));  // each large record gets its own block
   for (int i = 0; i < 40; i++) {
     auto got = lookup(*t, key_name(i));
     CHECK(got.has_value() && got->size() == 100 * 1024 && (*got)[0] == char('a' + i % 26));
   }
 }
 
-// A missing or corrupt .idx is rebuilt on open instead of trusted
-static void test_table_index_rebuild() {
-  std::string dir = test_dir("table_index");
-  std::map<std::string, std::string> data;
-  for (int i = 0; i < 100; i++) data[key_name(i)] = "v" + std::to_string(i);
-  std::string path = dir + "/sstable_0.sst";
-  make_table(path, data);
-
-  std::string idx = dir + "/sstable_0.idx";
-  {
-    std::ofstream out(idx, std::ios::binary | std::ios::trunc);
-    out << std::string(64, '\xFF');  // garbage: huge key_size / offsets
+// Run fn and report whether it threw
+static bool throws(const std::function<void()>& fn) {
+  try {
+    fn();
+  } catch (const std::exception&) {
+    return true;
   }
-  auto t = ss_table::open(path);
-  CHECK_EQ(t->index_size(), size_t(4));
-  CHECK(lookup(*t, key_name(77)) == std::optional<std::string>("v77"));
+  return false;
+}
 
-  fs::remove(idx);
-  auto t2 = ss_table::open(path);
-  CHECK(fs::exists(idx));
-  CHECK(lookup(*t2, key_name(99)) == std::optional<std::string>("v99"));
+static void flip_byte(const std::string& path, std::streamoff offset) {
+  std::fstream f(path, std::ios::binary | std::ios::in | std::ios::out);
+  f.seekg(offset);
+  char c;
+  f.get(c);
+  f.seekp(offset);
+  f.put(static_cast<char>(c ^ 0x01));
+}
+
+// Checksums and the footer turn corruption into errors instead of wrong answers
+static void test_table_corruption_detected() {
+  std::string dir = test_dir("table_corrupt");
+  std::map<std::string, std::string> data;
+  for (int i = 0; i < 100; i++) data[key_name(i)] = value_for(i);
+
+  // Bit flip inside the first data block: open still works (it doesn't read
+  // data blocks), but reading that block fails its checksum
+  std::string a = dir + "/sstable_0.sst";
+  make_table(a, data);
+  flip_byte(a, 20);
+  auto t = ss_table::open(a);
+  CHECK(throws([&] { lookup(*t, key_name(0)); }));
+  CHECK(lookup(*t, key_name(99)) == std::optional<std::string>(value_for(99)));  // other blocks fine
+
+  // Truncated file (crash before the footer was complete): bad magic
+  std::string b = dir + "/sstable_1.sst";
+  make_table(b, data);
+  fs::resize_file(b, fs::file_size(b) - 1);
+  CHECK(throws([&] { ss_table::open(b); }));
+
+  // Bit flip in the footer's block handles: footer checksum mismatch
+  std::string c = dir + "/sstable_2.sst";
+  make_table(c, data);
+  flip_byte(c, static_cast<std::streamoff>(fs::file_size(c) - ss_table::FOOTER_SIZE + 3));
+  CHECK(throws([&] { ss_table::open(c); }));
+
+  // Not an SSTable at all (or the old two-file format)
+  std::string d = dir + "/sstable_3.sst";
+  {
+    std::ofstream out(d, std::ios::binary);
+    out << std::string(200, 'z');
+  }
+  CHECK(throws([&] { ss_table::open(d); }));
+}
+
+// The bloom filter is stored on disk, so its hash must never change between
+// builds. This pins the exact value (computed independently in Python).
+static void test_bloom_filter_stable_and_persisted() {
+  CHECK_EQ(bloom_filter::hash(slice(std::string("hello"))), uint64_t(0xb7f9172fac45c7e0ULL));
+
+  bloom_filter f(1000, 0.01);
+  for (int i = 0; i < 1000; i++) f.add(slice(key_name(i)));
+  std::string bytes = f.serialize();
+  auto g = bloom_filter::deserialize(bytes.data(), bytes.size());
+  CHECK(g != nullptr);
+  int false_positives = 0;
+  for (int i = 0; i < 1000; i++) CHECK(g->contains(slice(key_name(i))));  // no false negatives
+  for (int i = 1000; i < 11000; i++) false_positives += g->contains(slice(key_name(i)));
+  CHECK(false_positives < 300);  // ~1% expected of 10,000
+  CHECK(bloom_filter::deserialize(bytes.data(), bytes.size() - 1) == nullptr);
+}
+
+static void test_builder_rejects_unsorted_keys() {
+  std::string dir = test_dir("builder_order");
+  std::string path = dir + "/sstable_0.sst";
+  {
+    sstable_builder builder(path);
+    builder.add(slice(std::string("b")), slice(std::string("1")));
+    CHECK(throws([&] { builder.add(slice(std::string("a")), slice(std::string("2"))); }));
+    CHECK(throws([&] { builder.add(slice(std::string("b")), slice(std::string("3"))); }));
+  }  // never finished: destructor removes the partial file
+  CHECK(!fs::exists(path));
+}
+
+// Bug: an unreadable compaction input used to be treated as an empty table,
+// so compaction "succeeded" and deleted the input along with its data.
+static void test_compaction_aborts_on_corrupt_input() {
+  std::string dir = test_dir("compaction_corrupt");
+  {
+    test_db db(dir, 100, false);
+    db.put("a", std::string(200, '1'));  // -> sstable_0
+    db.put("b", std::string(200, '2'));  // -> sstable_1
+  }
+  flip_byte(dir + "/sstable_0.sst", 20);  // corrupt a data block of the table holding "a"
+
+  test_db db(dir, 100, false);
+  db.compact();                                   // must fail, not drop "a"
+  CHECK_EQ(db.get_num_sstables(), size_t(2));     // inputs still live
+  CHECK(fs::exists(dir + "/sstable_0.sst"));
+  CHECK_EQ(db.get("b"), std::string(200, '2'));
 }
 
 // The table keeps its fd open: after compaction unlinks the file, a reader
@@ -320,7 +403,6 @@ static void test_table_readable_after_unlink() {
   std::string dir = test_dir("table_unlink");
   auto t = make_table(dir + "/sstable_0.sst", {{"a", "1"}, {"b", "2"}});
   fs::remove(dir + "/sstable_0.sst");
-  fs::remove(dir + "/sstable_0.idx");
   CHECK(lookup(*t, "b") == std::optional<std::string>("2"));
 }
 
@@ -399,7 +481,10 @@ int main() {
       {"table: lookup boundaries", test_table_lookup_boundaries},
       {"table: tiny and empty tables", test_table_tiny_and_empty},
       {"table: large values", test_table_large_values},
-      {"table: index rebuilt when missing/corrupt", test_table_index_rebuild},
+      {"table: corruption detected (checksums, footer)", test_table_corruption_detected},
+      {"bloom filter: stable hash, persisted", test_bloom_filter_stable_and_persisted},
+      {"builder: rejects unsorted keys, cleans up", test_builder_rejects_unsorted_keys},
+      {"compaction aborts on corrupt input", test_compaction_aborts_on_corrupt_input},
       {"table: readable after unlink", test_table_readable_after_unlink},
       {"model test (inline compaction)", [] { model_test(false); }},
       {"model test (background compaction)", [] { model_test(true); }},

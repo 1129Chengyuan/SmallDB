@@ -27,14 +27,9 @@ int sstable_number(const std::string& filename) {
   }
 }
 
-std::string index_path_for(const std::string& sstable_path) {
-  return sstable_path.substr(0, sstable_path.find_last_of('.')) + ".idx";
-}
-
 void remove_table_files(const std::string& sstable_path) {
   std::error_code ec;
   fs::remove(sstable_path, ec);
-  fs::remove(index_path_for(sstable_path), ec);
 }
 } // namespace
 
@@ -221,23 +216,17 @@ void smalldb::flush_memtable() {
   std::string sstable_name = get_next_sstable_name();
   smalldb_log::info("Flushing memtable to ", sstable_name);
 
-  // Create bloom filter BEFORE flushing
-  auto filter = std::make_unique<bloom_filter>(memtable_->getData().size(), 0.01);
-  for (const auto& [key, value] : memtable_->getData()) {
-    filter->add(slice(key));
-  }
-
-  // Table + index are fsync'd before we touch the WAL. On failure the data
-  // is still in the memtable and the WAL, so nothing is lost.
+  // The table (data, bloom filter, index, footer) is fsync'd before we touch
+  // the WAL. On failure the data is still in the memtable and the WAL.
   if (!ss_table::flush_memtable(*memtable_, sstable_name)) {
     remove_table_files(sstable_name);
     throw std::runtime_error("failed to flush memtable to " + sstable_name);
   }
 
-  // Open it once for the table cache, reusing the filter built above
+  // Open it once for the table cache
   std::shared_ptr<ss_table> table;
   try {
-    table = ss_table::open(sstable_name, std::move(filter));
+    table = ss_table::open(sstable_name);
   } catch (...) {
     remove_table_files(sstable_name);
     throw;
@@ -339,8 +328,10 @@ void smalldb::load_sstables() {
   }
   for (const auto& entry : fs::directory_iterator(data_dir_)) {
     const auto ext = entry.path().extension();
-    bool orphan_table = (ext == ".sst" || ext == ".idx") &&
-                        !live_stems.count(entry.path().stem().string());
+    // .idx files are from the old two-file format; the index now lives
+    // inside the .sst, so they're always stale
+    bool orphan_table = (ext == ".sst" && !live_stems.count(entry.path().stem().string())) ||
+                        ext == ".idx";
     if (orphan_table || ext == ".tmp") {
       smalldb_log::info("Removing orphaned file ", entry.path().string());
       std::error_code ec;
@@ -348,7 +339,8 @@ void smalldb::load_sstables() {
     }
   }
 
-  // Open each live table once (rebuilds a missing/invalid index itself)
+  // Open each live table once: reads only its footer, index, filter and meta
+  // blocks. Old-format (pre block-based) tables fail here with a clear error.
   for (const auto& filepath : live) {
     sstables_.push_back(ss_table::open(filepath));
   }
@@ -396,11 +388,6 @@ void smalldb::delete_old_sstables(const std::vector<std::string>& files) {
   for (const auto& file : files) {
     try {
       fs::remove(file);
-      // Also delete the corresponding index file
-      std::string index_file = index_path_for(file);
-      if (fs::exists(index_file)) {
-        fs::remove(index_file);
-      }
     } catch (const std::exception& e) {
       smalldb_log::error("Failed to delete ", file, ": ", e.what());
     }

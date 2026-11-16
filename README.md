@@ -23,15 +23,17 @@ Essentially, LSM-Tree databases are crash-pessimistic databases used for high th
 | `smalldb.cpp/h` | Coordinates MemTable, WAL, and SSTable management. |
 | `mem_table.cpp/h` | In-memory Red-Black Tree (`std::map`) providing  access. |
 | `wal.cpp/h` | Handles the append-only log for crash recovery, with a CRC32 checksum on every record. |
-| `ss_table.cpp/h` | Manages "Sorted String Tables" on disk, including binary format and indexing. |
-| `bloom_filter.cpp/h` | Probabilistic bitset used to skip SSTables that definitely don't contain a key. |
+| `ss_table.cpp/h` | Block-based "Sorted String Tables": `sstable_builder` writes them, `ss_table` opens and reads them, `SSTableIterator` streams them for compaction. |
+| `bloom_filter.cpp/h` | Probabilistic bitset used to skip SSTables that definitely don't contain a key. Stored inside each SSTable, using a stable hash. |
 | `compaction.cpp/h` | Merges multiple SSTables, discarding stale keys and tombstones. |
 | `slice.h` | Lightweight wrapper for pointers/lengths to avoid `std::string` copy overhead. |
 | `crc32.h` | CRC32 checksum used to detect torn or corrupted WAL records. |
+| `crc32c.h` | Hardware-accelerated CRC32C (ARM / x86) used to checksum every SSTable block. |
+| `coding.h` | Fixed-width little-endian encoding, so SSTable files are portable across machines. |
 | `file_util.h` | `fsync` helpers so flushed data actually reaches the disk. |
 | `log.h` | Thread-safe logging (the client thread and the compaction thread both log). |
 | `kv_engine.h` | Common interface so the same benchmark can drive SmallDB and RocksDB. |
-| `tests/smalldb_test.cpp` | Crash-recovery tests, SSTable edge cases, and a randomized test against `std::map`. |
+| `tests/smalldb_test.cpp` | Crash-recovery tests, SSTable edge cases, corruption detection, and a randomized test against `std::map`. |
 
 ---
 ### Performance Evolution & Optimizations
@@ -53,23 +55,47 @@ I implemented the following features to resolve these issues:
 
    I fixed them with a **MANIFEST** file (written atomically with write-temp + `fsync` + rename) that records which SSTables are live, **CRC32 checksums** on WAL records, and `fsync` before the WAL is cleared. All tests also pass under ThreadSanitizer.
 6. **Table Cache:** Profiling showed ~80% of every `get()` was system calls (`open` 35%, `read` 35%, `lseek` 11%): each lookup reopened the SSTable, re-parsed its whole index file and closed everything again. Now each SSTable is opened once and its index, bloom filter, key range and file descriptor stay in memory. A lookup checks the key range and bloom filter, binary-searches the in-memory index, and reads the one matching chunk with a single `pread`. **Random reads went from 46 µs to 0.66 µs (~70x).** Since SSTables are immutable, the cache never needs invalidating; tables are reference-counted, so compaction can delete a file while a reader is still using it.
+7. **Block-Based SSTables:** The old format had three problems:
+   * every table was two files (`.sst` + `.idx`);
+   * the bloom filter wasn't stored, so opening a table meant scanning all of its data to rebuild it;
+   * nothing checked the data for corruption.
+
+   Now each SSTable is one file: ~4 KB **data blocks**, then a **filter block** (the bloom filter), a **meta block** (entry count, smallest/largest key), an **index block** (the last key and location of every data block), and a fixed 64-byte **footer** at the very end that says where the other blocks are.
+   * **Every block carries a CRC32C checksum**, and the footer has a **magic number**, so corruption and truncated files become errors instead of wrong answers.
+   * Opening a table now reads only the footer, filter, meta and index blocks, so **opening a 1M-key database went from 63.6 ms to 0.68 ms (~93x)**.
+   * A lookup reads exactly one block, and large values get a block of their own instead of being pulled in 32 records at a time.
+
+   **Tradeoff:** verifying the checksum on every read costs ~0.4 µs, so random reads went from 0.66 µs to 1.09 µs. I chose to keep verification on every read (RocksDB's default too), because returning corrupted data silently is worse than a slightly slower read. Writing this also exposed one more data-loss bug: an unreadable compaction input was treated as an empty table and then deleted. Compaction now aborts instead.
 
 ### Internal Storage Format
 
-#### SSTable Binary Layout
+#### SSTable Binary Layout (format version 2, block-based)
 
-SSTables are stored as immutable, sorted files on disk. The data is laid out sequentially to optimize for streaming reads:
+SSTables are immutable, sorted files. Each one is a single file:
 
-1. **Data Block**: A series of entries where each entry consists of:
-* `key_size` (size_t)
-* `value_size` (size_t)
-* `key_data` (variable length)
-* `value_data` (variable length)
+```
+[data block 0] ... [data block K-1] [filter block] [meta block] [index block] [footer: 64 bytes]
+every block = [contents][crc32c checksum: 4 bytes]
+```
 
+1. **Data Blocks** (~4 KB each): records sorted by key, each one stored as
+   * `key_len` (u32), `value_len` (u32), `key`, `value`.
 
-2. **Sparse Index** (separate `sstable_N.idx` file): every 32nd key mapped to its byte offset in the data file, so a lookup only has to scan one 32-entry chunk. Loaded into memory once, when the table is opened.
-3. **Bloom Filter**: built in memory when the table is opened (not stored on disk) and used for membership testing before performing disk I/O.
-4. **MANIFEST**: a small file listing the live SSTables, newest first. It's replaced atomically after every flush and compaction, and on startup any SSTable not listed in it is deleted as a leftover from a crash.
+   A record never spans two blocks, so a large value just gets one large block.
+2. **Filter Block**: the serialized bloom filter for every key in the table (1% false-positive rate). It uses a stable hash (FNV-1a + a mixing step), because `std::hash` can change between compilers, and a changed hash would make a stored filter reject keys that are actually present.
+3. **Meta Block**: the number of entries plus the smallest and largest key, used to skip tables whose key range can't contain the key.
+4. **Index Block**: for every data block, its last key and its offset and size. A lookup binary-searches this for the first block whose last key is ≥ the key it's looking for.
+5. **Footer**: a fixed 64 bytes at the end of the file, holding:
+   * the locations of the filter, meta and index blocks;
+   * the format version;
+   * a checksum of the footer itself;
+   * a magic number.
+
+   It's written last, so a file cut short by a crash has no valid magic number at its end.
+
+All integers are little-endian. Opening a table reads the footer, then the filter, meta and index blocks, and keeps them in memory for the table's lifetime. A lookup is one `pread` of one data block plus a checksum check.
+
+**MANIFEST**: a small file listing the live SSTables, newest first. It's replaced atomically after every flush and compaction, and on startup any SSTable not listed in it is deleted as a leftover from a crash.
 
 ---
 
@@ -232,6 +258,38 @@ Keeping each SSTable open with its index in memory removed the file opens and in
 
 ---
 
+#### With Block-Based SSTables
+
+Each table is now one file with its bloom filter and index stored inside, and every block is checksummed. Writes got ~20% faster (smaller 4-byte length fields, and no separate index file to write and fsync). Reads got slower (0.66 → 1.09 µs) because every lookup verifies its block's CRC32C. I chose that tradeoff on purpose: see #7 above.
+
+| Benchmark | Operations | Duration | Throughput | Latency |
+| --- | --- | --- | --- | --- |
+| Sequential Writes | 5000 ops | 24.33 ms | **205486 ops/s** | **4.87 µs** |
+| Random Writes | 5000 ops | 26.24 ms | **190533 ops/s** | **5.25 µs** |
+| Sequential Reads | 5000 ops | 5.33 ms | 937427 ops/s | 1.07 µs |
+| Random Reads | 5000 ops | 5.47 ms | 913458 ops/s | 1.09 µs |
+| Updates (Overwrites) | 2500 ops | 11.07 ms | 225875 ops/s | 4.43 µs |
+| Deletions | 2500 ops | 3.95 ms | 633449 ops/s | 1.58 µs |
+| Mixed Workload (50% R/W) | 5000 ops | 14.96 ms | 334133 ops/s | 2.99 µs |
+| Full Compaction (4766 keys) | 1 ops | n/a* | n/a* | n/a* |
+| Large Values (1024 bytes) | 500 ops | 14.68 ms | 34067 ops/s | 29.35 µs |
+| Large Values (10240 bytes) | 500 ops | 174.84 ms | 2860 ops/s | 349.67 µs |
+| Large Values (102400 bytes) | 50 ops | 152.70 ms | 327 ops/s | 3053.98 µs |
+| WAL Recovery (2500 entries) | 2500 ops | 1.40 ms | 1781092 ops/s | 0.56 µs |
+
+\* This run reported 0.00 ms. Background compaction had already merged everything before the benchmark called `compact()`, so there was nothing left to merge. Whether that happens depends on timing, so this row isn't reliable. The fix is to turn off background compaction for this one benchmark.
+
+**Opening the database** (new benchmark: write N keys with 100-byte values, close, then time reopening; best of 5):
+
+| Keys | Data on disk | Before (2 files, filter rebuilt) | After (block-based) | Speedup |
+| --- | --- | --- | --- | --- |
+| 200,000 | 26 MB | 12.89 ms | 0.22 ms | ~59x |
+| 1,000,000 | 129 MB → 122 MB | 63.55 ms | 0.68 ms | ~93x |
+
+The old open time grows with the total amount of data (rebuilding the bloom filter reads every byte), while the new one only depends on the size of the index and filter blocks. Both were measured with the files already in the OS page cache, so on a cold disk the old format would be much slower.
+
+---
+
 #### RocksDB Reference (same benchmark, same machine)
 
 For context, here's RocksDB run through the same harness (same memtable size, no compression, bloom filters on, WAL not fsync'd per write, matching SmallDB). The whole dataset is ~550 KB and fits in the OS page cache, so this measures in-memory code paths, not disk performance. RocksDB is built for datasets far larger than RAM, which this benchmark doesn't test.
@@ -291,6 +349,7 @@ The benchmark suite in `main.cpp` automatically generates test data, measures pe
 * **Crash Safety**: MANIFEST of live SSTables, CRC32-checksummed WAL records, and `fsync` before the WAL is cleared.
 * **Testing**: Crash-recovery tests, SSTable edge-case tests, and a randomized test against `std::map`, all passing under ThreadSanitizer.
 * **Table Cache**: Each SSTable opened once with its index in memory; one `pread` per lookup (~70x faster reads).
+* **Block-Based SSTables**: One file per table with data, filter, meta and index blocks, a footer, and a CRC32C checksum on every block (~93x faster database open).
 
 #### In Progress
 
@@ -299,7 +358,8 @@ The benchmark suite in `main.cpp` automatically generates test data, measures pe
 #### Not Started
 
 * **Advanced Compaction Strategies**: Leveled Compaction to further reduce read and space amplification beyond the current size-tiered approach.
-* **Storage Compression**: Implementing block-level compression to reduce the on-disk footprint of SSTables.
+* **Storage Compression**: Implementing block-level compression (LZ4/Zstd) to reduce the on-disk footprint of SSTables. Block-based SSTables make this possible now.
+* **Faster Checksums**: Splitting each block's CRC32C into three interleaved streams (~3x faster) to win back most of the ~0.4 µs per read.
 
 
 
@@ -327,6 +387,9 @@ deleted keys came back from disk while the tombstone was still in the memtable (
 background compaction lost sstables that were flushed during the merge (only replace the inputs)  
 a crash mid-compaction could resurrect deleted keys (MANIFEST)  
 every get() reopened the sstable and re-read its whole index file (table cache)  
+opening the db scanned every sstable to rebuild bloom filters (block-based sstables, filter stored in the file)  
+no checksums on sstable data, so corruption was returned as real data (crc32c on every block)  
+an unreadable compaction input was treated as empty and then deleted (compaction aborts now)  
 
 
 **Completed**  
@@ -441,3 +504,19 @@ Leveled compaction
 ║ Large Values (10240 bytes)          |      500 ops |     177.65 ms |       2814 ops/s |   355.31 µs |     4.36 ms
 ║ Large Values (102400 bytes)         |       50 ops |     174.77 ms |        286 ops/s |  3495.44 µs |    22.20 ms
 ║ WAL Recovery (2500 entries)         |     2500 ops |       1.42 ms |    1763585 ops/s |     0.57 µs |     0.02 ms
+
+**With Block-Based SSTables** (Full Compaction row invalid: nothing left to compact, see above)
+║ Sequential Writes                   |     5000 ops |      24.33 ms |     205486 ops/s |     4.87 µs |     0.46 ms
+║ Random Writes                       |     5000 ops |      26.24 ms |     190533 ops/s |     5.25 µs |     4.06 ms
+║ Sequential Reads                    |     5000 ops |       5.33 ms |     937427 ops/s |     1.07 µs |     0.20 ms
+║ Random Reads                        |     5000 ops |       5.47 ms |     913458 ops/s |     1.09 µs |     0.05 ms
+║ Updates (Overwrites)                |     2500 ops |      11.07 ms |     225875 ops/s |     4.43 µs |     0.19 ms
+║ Deletions                           |     2500 ops |       3.95 ms |     633449 ops/s |     1.58 µs |     0.67 ms
+║ Mixed Workload (50% R/W)            |     5000 ops |      14.96 ms |     334133 ops/s |     2.99 µs |     1.11 ms
+║ Full Compaction (4766 keys)         |        1 ops |       0.00 ms |     710026 ops/s |     1.41 µs |     0.00 ms
+║ Large Values (1024 bytes)           |      500 ops |      14.68 ms |      34067 ops/s |    29.35 µs |     0.18 ms
+║ Large Values (10240 bytes)          |      500 ops |     174.84 ms |       2860 ops/s |   349.67 µs |    11.71 ms
+║ Large Values (102400 bytes)         |       50 ops |     152.70 ms |        327 ops/s |  3053.98 µs |     7.49 ms
+║ WAL Recovery (2500 entries)         |     2500 ops |       1.40 ms |    1781092 ops/s |     0.56 µs |     0.02 ms
+
+DB open (best of 5): 200K keys 12.89 ms -> 0.22 ms, 1M keys 63.55 ms -> 0.68 ms
